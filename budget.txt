@@ -1,0 +1,19 @@
+[
+    ['bicycle', 3000_000],
+    ['flowers', 1500_000],
+    ['garden', 3000_000],
+    ['stump', 3000_000],
+    ['treehill', 1500_000],
+
+    ['bonsai', 1000_000],
+    ['counter', 1000_000],
+    ['kitchen', 1000_000],
+    ['room', 1000_000],
+
+    ['drjohnson', 1500_000],
+    ['playroom', 1000_000],
+
+    ['train', 130_0000], conf_thr = 0.8
+    ['truck', 200_0000], conf_thr = 0.8
+]
+
