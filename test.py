@@ -55,6 +55,8 @@ for data, group, budget in paramList:
         scene_metrics['conf_time_ms'] = prof_data.get('conf_time', 0.0)
         scene_metrics['rfas_time_ms'] = prof_data.get('rfas_time', 0.0)
         scene_metrics['fusion_time_ms'] = prof_data.get('fusion_time', 0.0)
+    else:
+        print(f"  [WARN] {out}/profiler_results.json not found — did training use --profile_components?")
 
     # 3. SSIM and LPIPS (from metrics.py results.json)
     # results.json structure: {method: {"SSIM":..., "PSNR":..., "LPIPS":...}}
@@ -68,6 +70,10 @@ for data, group, budget in paramList:
             target = max(ours_methods, key=lambda m: int(m.split('_')[-1]))
             scene_metrics['SSIM'] = results[target].get('SSIM', 0.0)
             scene_metrics['LPIPS'] = results[target].get('LPIPS', 0.0)
+        else:
+            print(f"  [WARN] No 'ours_*' method found in {out}/results.json")
+    else:
+        print(f"  [WARN] {out}/results.json not found — did render.py / metrics.py run?")
 
     ALL_METRICS[data] = scene_metrics
     print(f"  Collected {data}: {scene_metrics}")
