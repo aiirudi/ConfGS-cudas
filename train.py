@@ -127,30 +127,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         
 
         # 加入 PAIR Loss (方案 B: 单圆盘 mask + 三段折线半径退火, 与论文公式对齐)
-        # if opt.lambda_amp_rec > 0:
-        #     r_t = get_multiscale_amp_rec_mask_ratio(
-        #         iteration,
-        #         stage1_iter=opt.amp_rec_stage1_iter,
-        #         stage2_iter=opt.amp_rec_stage2_iter,
-        #         low_ratio=opt.amp_rec_mask_ratio_low,
-        #         mid_ratio=opt.amp_rec_mask_ratio_mid,
-        #         high_ratio=opt.amp_rec_mask_ratio_high,
-        #         final_transition_len=opt.amp_rec_final_transition_len,
-        #     )
-        #     # 权重调度: ≤14000 用原值, 14000→15000 线性退火至一半, >15000 保持一半
-        #     """
-        #     if iteration <= 14000:
-        #         lambda_amp_t = opt.lambda_amp_rec
-        #     elif iteration <= 15000:
-        #         t = (iteration - 14000) / 1000.0
-        #         lambda_amp_t = opt.lambda_amp_rec * (1.0 - 0.5 * t)
-        #     else:
-        #         lambda_amp_t = opt.lambda_amp_rec * 0.5
-        #     """
-            
-        #     loss += opt.lambda_amp_rec * amplitude_reconstruction_loss(
-        #         image, gt_image, use_log=True, mask_ratio=r_t,
-        #     )
+        if opt.lambda_amp_rec > 0:
+            r_t = get_multiscale_amp_rec_mask_ratio(
+                iteration,
+                stage1_iter=opt.amp_rec_stage1_iter,
+                stage2_iter=opt.amp_rec_stage2_iter,
+                low_ratio=opt.amp_rec_mask_ratio_low,
+                mid_ratio=opt.amp_rec_mask_ratio_mid,
+                high_ratio=opt.amp_rec_mask_ratio_high,
+                final_transition_len=opt.amp_rec_final_transition_len,
+            )
+            loss += opt.lambda_amp_rec * amplitude_reconstruction_loss(
+                image, gt_image, use_log=True, mask_ratio=r_t,
+            )
 
 
 
@@ -183,6 +172,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+
+            # Per-component stage time logging (in training() scope where accumulators live)
+            if tb_writer and opt.profile_components:
+                for comp in ['conf', 'rfas', 'fusion']:
+                    if stage_counts.get(comp, 0) > 0:
+                        tb_writer.add_scalar('stage_time/' + comp,
+                            stage_times[comp] / max(stage_counts[comp], 1), iteration)
+                        tb_writer.add_scalar('memory/' + comp,
+                            stage_memory[comp] / max(stage_counts[comp], 1), iteration)
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -786,13 +784,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
-        # Per-component stage times (logged at densification interval for sparse components)
-        for comp in ['conf', 'rfas', 'fusion']:
-            if stage_counts.get(comp, 0) > 0:
-                tb_writer.add_scalar('stage_time/' + comp,
-                    stage_times[comp] / max(stage_counts[comp], 1), iteration)
-                tb_writer.add_scalar('memory/' + comp,
-                    stage_memory[comp] / max(stage_counts[comp], 1), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
