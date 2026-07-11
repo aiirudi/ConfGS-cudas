@@ -57,15 +57,17 @@ for data, group, budget in paramList:
         scene_metrics['fusion_time_ms'] = prof_data.get('fusion_time', 0.0)
 
     # 3. SSIM and LPIPS (from metrics.py results.json)
+    # results.json structure: {scene_dir: {method: {"SSIM":..., "PSNR":..., "LPIPS":...}}}
     results_path = os.path.join(out, 'results.json')
     if os.path.exists(results_path):
         with open(results_path, 'r') as fp:
             results = json.load(fp)
-        for method_name, method_metrics in results.items():
-            if method_name == out:
+        # The top-level key matches out path; grab the first method's metrics
+        if out in results:
+            for method_name, method_metrics in results[out].items():
                 scene_metrics['SSIM'] = method_metrics.get('SSIM', 0.0)
                 scene_metrics['LPIPS'] = method_metrics.get('LPIPS', 0.0)
-                break
+                break  # Take the first method's metrics
 
     ALL_METRICS[data] = scene_metrics
     print(f"  Collected {data}: {scene_metrics}")
