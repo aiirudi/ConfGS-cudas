@@ -76,6 +76,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
     stage_times = defaultdict(float)
     stage_counts = defaultdict(int)
     stage_memory = defaultdict(float)
+    train_wall_start = time.time()
 
     lambda_efre_wl, lambda_efre_wh = opt.lambda_efre_wl, opt.lambda_efre_wh
 
@@ -248,14 +249,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         mode='weighted'
                     )
 
-                    # Stop fusion timer BEFORE baseline densification (LAS/pruning)
-                    if opt.profile_components:
-                        end_fusion.record()
-                        torch.cuda.synchronize()
-                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
-                        stage_counts['fusion'] += 1
-                        stage_memory['fusion'] += (torch.cuda.max_memory_allocated() - mem_before_fusion)
-
                     #tt_importance = gaussian_importance_rf # 只启用 rfas
 
                     startI = opt.densify_from_iter
@@ -269,6 +262,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
                     # LAS 入口, 最后再densify_and_prune_Improved 中调用 LAS
                     gaussians.densify_and_prune_Improved(tt_importance, 0.005, budget, opt, iteration, opt.budget)
+
+                    # Stop fusion timer AFTER fused-score consumption (densify_and_prune_Improved)
+                    if opt.profile_components:
+                        end_fusion.record()
+                        torch.cuda.synchronize()
+                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
+                        stage_counts['fusion'] += 1
+                        stage_memory['fusion'] += (torch.cuda.max_memory_allocated() - mem_before_fusion)
                 
             
                 if iteration % opt.opacity_reset_interval == 0:
@@ -312,16 +313,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                                     iter_start.elapsed_time(iter_end), [iteration],
                                     scene, render, (pipe, background))
             # Print summary (after all probes accumulated)
-            total_time = sum(stage_times.values())
+            wall_elapsed_ms = (time.time() - train_wall_start) * 1000
             print("\n=== Component Profiling Summary ===")
             print(f"{'Component':<12} {'Time(ms)':<12} {'%Total':<10} {'Calls':<10}")
             print("-" * 46)
             for comp in ['conf', 'rfas', 'fusion']:
                 t = stage_times.get(comp, 0.0)
                 c = stage_counts.get(comp, 0)
-                pct = (t / total_time * 100) if total_time > 0 else 0.0
+                pct = (t / wall_elapsed_ms * 100) if wall_elapsed_ms > 0 else 0.0
                 print(f"{comp:<12} {t:<12.2f} {pct:<10.2f} {c:<10}")
-            print(f"{'TOTAL':<12} {total_time:<12.2f} {'100.00':<10}")
+            print(f"{'TRAINING':<12} {wall_elapsed_ms:<12.2f} {'100.00':<10}")
             print("==================================\n")
             # Save to JSON
             import json as _json
