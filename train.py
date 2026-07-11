@@ -173,7 +173,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             if opt.densify_from_iter < iteration < opt.densify_until_iter:
                 
                 # EAS 中计算
-                gaussians.add_densification_stats_abs(viewspace_point_tensor, visibility_filter)
+                gaussians.add_densification_stats_abs(viewspace_point_tensor, visibility_filter, viewpoint_cam)
 
                 if iteration % opt.densification_interval == 0:     
                     # 默认用 args.cams 个视角来计算重要性

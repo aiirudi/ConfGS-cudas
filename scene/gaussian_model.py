@@ -173,8 +173,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        # 初始化新增 Conf 向量
-        self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 2), device='cuda')
+        # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
+        self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 3), device='cuda')
         self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
 
         # 初始化冷却计数器 (初始全部为0,表示可以立即参与分裂)
@@ -391,8 +391,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        # 重置新加入计算 Conf 的统计量
-        self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
+        # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
+        self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         # 重置冷却计数器
@@ -423,8 +423,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        # 对新加入的统计量重置
-        self.xyz_gradient_vec_accum= torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
+        # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
+        self.xyz_gradient_vec_accum= torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         # 重置冷却计数器
@@ -488,28 +488,137 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+    def _compute_ndc_vjp_world(self, xyz_world, grad_ndc, update_filter, full_proj_transform, eps=1e-8):
+        """
+        Pull the per-view NDC-space positional gradient back to the
+        common world coordinate system using the transpose of the
+        camera projection Jacobian.
 
-        # 在计算 abs 时候同时统计带方向的梯度向量
-        # Conf：带方向的 xy 梯度向量
-        g = viewspace_point_tensor.grad[update_filter, :2]  # (n,2)
-        self.xyz_gradient_vec_accum[update_filter] += g
-        self.xyz_gradient_mag_accum[update_filter] += torch.norm(g, dim=-1, keepdim=True)
+        Cross-view cancellation is evaluated only after all gradients
+        are represented in the same world-space coordinate frame.
 
-        self.denom[update_filter] += 1
+        The NDC Jacobian for row-vector convention (clip = xyz_h @ M):
+          d(ndc_x)/d(xyz_i) = (M[i,0]*qw - M[i,3]*qx) / qw^2
+          d(ndc_y)/d(xyz_i) = (M[i,1]*qw - M[i,3]*qy) / qw^2
+        J_ndc ∈ R^{2×3}, g_world = J_ndc^T @ g_ndc ∈ R^3
+
+        Args:
+            xyz_world: (N, 3) all Gaussian world positions (detached)
+            grad_ndc:  (n, 2) dL/d(NDC_xy) for visible Gaussians (detached)
+            update_filter: indices or bool mask selecting n from N
+            full_proj_transform: (4, 4) world-to-clip projection matrix
+            eps: numerical stability threshold
+
+        Returns:
+            g_world: (N, 3) world-space gradient vectors (zero for invalid)
+            valid:   (N,)   boolean mask of Gaussians with valid world gradients
+        """
+        N = xyz_world.shape[0]
+        device = xyz_world.device
+
+        # Only transform the visible subset
+        xyz_vis = xyz_world[update_filter]  # (n, 3)
+
+        # Row-vector homogeneous transform: clip = xyz_h @ M
+        xyz_h = torch.cat([xyz_vis, torch.ones_like(xyz_vis[:, :1])], dim=-1)  # (n, 4)
+        clip = xyz_h @ full_proj_transform  # (n, 4)
+
+        qx = clip[:, 0]  # (n,)
+        qy = clip[:, 1]  # (n,)
+        qw = clip[:, 3]  # (n,)
+
+        # Exclude points at or behind the camera plane
+        safe_qw = torch.where(qw.abs() > eps, qw, torch.full_like(qw, eps))
+
+        # Extract matrix columns for the xyz rows (indices 0,1,2) of the
+        # projection-matrix rows that participate in ndc_x, ndc_y, and w.
+        # full_proj_transform is stored transposed in PyTorch (row-vector
+        # convention matches geom_transform_points).
+        Mx_xyz = full_proj_transform[:3, 0]  # (3,)  column 0, rows 0..2
+        My_xyz = full_proj_transform[:3, 1]  # (3,)  column 1, rows 0..2
+        Mw_xyz = full_proj_transform[:3, 3]  # (3,)  column 3, rows 0..2
+
+        # Jacobian rows: d(ndc_x)/d(xyz) and d(ndc_y)/d(xyz)
+        jac_x = (Mx_xyz[None, :] * safe_qw[:, None] - Mw_xyz[None, :] * qx[:, None]) / safe_qw[:, None].square()  # (n, 3)
+        jac_y = (My_xyz[None, :] * safe_qw[:, None] - Mw_xyz[None, :] * qy[:, None]) / safe_qw[:, None].square()  # (n, 3)
+
+        # J_ndc: (n, 2, 3), then g_world = J_ndc^T @ g_ndc
+        jacobian = torch.stack([jac_x, jac_y], dim=1)  # (n, 2, 3)
+        g_world_vis = torch.bmm(jacobian.transpose(1, 2), grad_ndc.unsqueeze(-1)).squeeze(-1)  # (n, 3)
+
+        # Validity: behind-camera, NaN, Inf
+        valid_vis = (
+            (qw.abs() > eps)
+            & torch.isfinite(g_world_vis).all(dim=-1)
+            & torch.isfinite(grad_ndc).all(dim=-1)
+        )
+
+        # Scatter back to full-size tensors
+        g_world = torch.zeros((N, 3), device=device, dtype=torch.float32)
+        valid = torch.zeros(N, device=device, dtype=torch.bool)
+
+        g_world[update_filter] = g_world_vis
+        valid[update_filter] = valid_vis
+
+        g_world[~valid] = 0.0
+        return g_world, valid
+
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, viewpoint_cam=None):
+        # Normalize update_filter to 1D indices (nonzero() returns (n,1) in some versions)
+        idx = update_filter.view(-1) if update_filter.dim() > 1 else update_filter
+        self.xyz_gradient_accum[idx] += torch.norm(viewspace_point_tensor.grad[idx,:2], dim=-1, keepdim=True)
+
+        # Conf: pull per-view NDC-space positional gradient back to world-space
+        # via the camera projection Jacobian transpose, then accumulate the
+        # 3D world-space vector and its norm.
+        if viewpoint_cam is not None:
+            g_ndc = viewspace_point_tensor.grad[idx, :2].detach()  # (n,2) dL/d(NDC_xy)
+            g_world, _valid = self._compute_ndc_vjp_world(
+                self.get_xyz.detach(),
+                g_ndc,
+                idx,
+                viewpoint_cam.full_proj_transform,
+            )
+            self.xyz_gradient_vec_accum[idx] += g_world[idx]
+            self.xyz_gradient_mag_accum[idx] += torch.norm(g_world[idx], dim=-1, keepdim=True)
+        else:
+            # Fallback: original 2D NDC accumulation (backward compatibility)
+            # Pad to 3D with zero z-component to match the (N,3) accumulator
+            g = viewspace_point_tensor.grad[idx, :2]  # (n,2)
+            g_pad = torch.cat([g, torch.zeros_like(g[:, :1])], dim=-1)  # (n,3)
+            self.xyz_gradient_vec_accum[idx] += g_pad
+            self.xyz_gradient_mag_accum[idx] += torch.norm(g, dim=-1, keepdim=True)
+
+        self.denom[idx] += 1
 
     # EAS 中的计算视角绝对值
-    def add_densification_stats_abs(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,2:], dim=-1, keepdim=True)
+    def add_densification_stats_abs(self, viewspace_point_tensor, update_filter, viewpoint_cam=None):
+        # Normalize update_filter to 1D indices (nonzero() returns (n,1) in some versions)
+        idx = update_filter.view(-1) if update_filter.dim() > 1 else update_filter
+        self.xyz_gradient_accum[idx] += torch.norm(viewspace_point_tensor.grad[idx,2:], dim=-1, keepdim=True)
 
-        # 在计算 abs 时候同时统计带方向的梯度向量
-        # Conf：带方向的 xy 梯度向量
-        g = viewspace_point_tensor.grad[update_filter, :2]  # (n,2)
-        self.xyz_gradient_vec_accum[update_filter] += g
-        self.xyz_gradient_mag_accum[update_filter] += torch.norm(g, dim=-1, keepdim=True)
-        
-        self.denom[update_filter] += 1
+        # Conf: pull per-view NDC-space positional gradient back to world-space
+        # via the camera projection Jacobian transpose, then accumulate the
+        # 3D world-space vector and its norm.
+        if viewpoint_cam is not None:
+            g_ndc = viewspace_point_tensor.grad[idx, :2].detach()  # (n,2) dL/d(NDC_xy)
+            g_world, _valid = self._compute_ndc_vjp_world(
+                self.get_xyz.detach(),
+                g_ndc,
+                idx,
+                viewpoint_cam.full_proj_transform,
+            )
+            self.xyz_gradient_vec_accum[idx] += g_world[idx]
+            self.xyz_gradient_mag_accum[idx] += torch.norm(g_world[idx], dim=-1, keepdim=True)
+        else:
+            # Fallback: original 2D NDC accumulation (backward compatibility)
+            # Pad to 3D with zero z-component to match the (N,3) accumulator
+            g = viewspace_point_tensor.grad[idx, :2]  # (n,2)
+            g_pad = torch.cat([g, torch.zeros_like(g[:, :1])], dim=-1)  # (n,3)
+            self.xyz_gradient_vec_accum[idx] += g_pad
+            self.xyz_gradient_mag_accum[idx] += torch.norm(g, dim=-1, keepdim=True)
+
+        self.denom[idx] += 1
 
     # LAS 实现: 按 score 加权（multinomial）从可分裂候选中采 budget 个父高斯，
     # 仅沿最长 scaling 轴分裂为两个子高斯（±split_distance·3σ_long），
