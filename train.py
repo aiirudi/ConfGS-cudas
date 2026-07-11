@@ -155,21 +155,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             if iteration == opt.iterations:
                 progress_bar.close()
 
-                # Print profiler summary for user-added components
-                if opt.profile_components:
-                    total_time = sum(stage_times.values())
-                    print("\n=== Component Profiling Summary ===")
-                    print(f"{'Component':<12} {'Time(ms)':<12} {'%Total':<10} {'Calls':<10} {'MemΔ(MB)':<12}")
-                    print("-" * 56)
-                    for comp in ['conf', 'rfas', 'fusion']:
-                        t = stage_times.get(comp, 0.0)
-                        c = stage_counts.get(comp, 0)
-                        m = stage_memory.get(comp, 0.0)
-                        pct = (t / total_time * 100) if total_time > 0 else 0.0
-                        print(f"{comp:<12} {t:<12.2f} {pct:<10.2f} {c:<10} {m/1024/1024:<12.2f}")
-                    print(f"{'TOTAL':<12} {total_time:<12.2f} {'100.00':<10}")
-                    print("==================================\n")
-
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
 
@@ -318,12 +303,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     gaussians.optimizer.step(visible, radii.shape[0])
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-        # Profiler export: run AFTER all densification/optimizer probes complete
+        # Profiler summary + export: run AFTER all densification/optimizer probes
         if opt.profile_components and iteration == opt.iterations:
-            if iteration not in testing_iterations:
-                training_report(tb_writer, iteration, Ll1, loss, l1_loss,
-                                iter_start.elapsed_time(iter_end), [iteration],
-                                scene, render, (pipe, background))
+            with torch.no_grad():
+                if iteration not in testing_iterations:
+                    training_report(tb_writer, iteration, Ll1, loss, l1_loss,
+                                    iter_start.elapsed_time(iter_end), [iteration],
+                                    scene, render, (pipe, background))
+            # Print summary (after all probes accumulated)
+            total_time = sum(stage_times.values())
+            print("\n=== Component Profiling Summary ===")
+            print(f"{'Component':<12} {'Time(ms)':<12} {'%Total':<10} {'Calls':<10}")
+            print("-" * 46)
+            for comp in ['conf', 'rfas', 'fusion']:
+                t = stage_times.get(comp, 0.0)
+                c = stage_counts.get(comp, 0)
+                pct = (t / total_time * 100) if total_time > 0 else 0.0
+                print(f"{comp:<12} {t:<12.2f} {pct:<10.2f} {c:<10}")
+            print(f"{'TOTAL':<12} {total_time:<12.2f} {'100.00':<10}")
+            print("==================================\n")
+            # Save to JSON
             import json as _json
             n_gs = gaussians.get_xyz.shape[0]
             prof_data = {
