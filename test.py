@@ -78,8 +78,9 @@ for data, group, budget in paramList:
     ALL_METRICS[data] = scene_metrics
     print(f"  Collected {data}: {scene_metrics}")
 
-# Write all scene metrics to a single JSON
-metrics_path = 'metrics.json'
-with open(metrics_path, 'w') as fp:
-    json.dump(ALL_METRICS, fp, indent=True)
-print(f"\nAll metrics saved to {metrics_path}")
+    # 每完成一个场景立即写入 metrics.json，防止后续场景崩溃丢失数据
+    metrics_path = 'metrics.json'
+    with open(metrics_path, 'w') as fp:
+        json.dump(ALL_METRICS, fp, indent=True)
+
+print(f"\nAll metrics saved to metrics.json")
