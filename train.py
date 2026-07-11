@@ -248,6 +248,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         mode='weighted'
                     )
 
+                    # Stop fusion timer BEFORE baseline densification (LAS/pruning)
+                    if opt.profile_components:
+                        end_fusion.record()
+                        torch.cuda.synchronize()
+                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
+                        stage_counts['fusion'] += 1
+                        stage_memory['fusion'] += (torch.cuda.max_memory_allocated() - mem_before_fusion)
+
                     #tt_importance = gaussian_importance_rf # 只启用 rfas
 
                     startI = opt.densify_from_iter
@@ -261,13 +269,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
                     # LAS 入口, 最后再densify_and_prune_Improved 中调用 LAS
                     gaussians.densify_and_prune_Improved(tt_importance, 0.005, budget, opt, iteration, opt.budget)
-
-                    if opt.profile_components:
-                        end_fusion.record()
-                        torch.cuda.synchronize()
-                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
-                        stage_counts['fusion'] += 1
-                        stage_memory['fusion'] += (torch.cuda.max_memory_allocated() - mem_before_fusion)
                 
             
                 if iteration % opt.opacity_reset_interval == 0:
