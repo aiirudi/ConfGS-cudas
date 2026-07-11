@@ -359,6 +359,87 @@ $$
 
 ---
 
+## 11.5 RFGS 项目中的实际实现（方案 B：单圆盘 mask + 三段退火半径）
+
+> 说明：本节描述 RFGS 仓库 `train.py` 中**方案 B** 的实现。它在 §5~§8 的「单一低通圆盘 mask」基础上，把简单的线性退火升级为**三段折线 (low → mid → high)** 的半径调度，仍是单尺度 ifft + L1，调用入口为 `amplitude_reconstruction_loss`，半径调度器为 `get_multiscale_amp_rec_mask_ratio`。
+
+### 11.5.1 实现思路
+
+仍然采用「FFT → log(1+|·|) → fftshift → 低通圆盘 mask → ifftshift → ifft → 取实部 → L1」这一条单尺度链路，不做环带切分，每步只产生一张幅度反重建图，再与真值比较。关键的改动在于**半径 `r(t)` 的退火曲线**：不是简单的线性 ramp，而是分成三段，对应 3DGS 训练阶段的「稳几何 / 补纹理 / 收细节」：
+
+1. **低频锁定阶段** $t \le t_1$（默认 `stage1_iter = 5000`）：半径恒定为 `low_ratio = 0.15`，只让幅度反重建去约束低频能量分布，避免训练早期高频幅度被错误几何带偏；
+2. **中频过渡阶段** $t_1 < t \le t_2$（默认 `stage2_iter = 12000`）：半径在 `low_ratio → mid_ratio` 之间线性插值，逐步把物体级纹理频段纳入监督；
+3. **高频收敛阶段** $t > t_2$：半径在 `mid_ratio → high_ratio` 之间线性插值，过渡长度由 `final_transition_len = 8000` 控制（即 `stage2_iter + final_transition_len = 20000` 后半径稳定在 `high_ratio`，默认 `high_ratio = 0.99`）。
+
+整张图谱共用一个动态半径的圆盘 mask，因此每步只做一次 ifft、一次 L1，相对环带版本计算量更小，但单帧只能传递「当前半径以内」这一频段的梯度。
+
+### 11.5.2 主要公式
+
+**圆盘 mask**（在 fftshift 之后的频域，原点位于图像中心 $(c_u, c_v)$）：
+
+$$
+M_{r(t)}(u,v)
+= \mathbb{1}\!\left[
+\sqrt{(u-c_u)^2+(v-c_v)^2}
+\le r(t)\cdot d_{\max}
+\right],
+\qquad
+d_{\max} = \sqrt{c_u^2 + c_v^2}.
+$$
+
+**三段折线退火**（对应 `get_multiscale_amp_rec_mask_ratio`，记 $r_l, r_m, r_h$ 为 `low_ratio, mid_ratio, high_ratio`，$T_f$ 为 `final_transition_len`）：
+
+$$
+r(t)=
+\begin{cases}
+r_l, & t \le t_1,\\[4pt]
+r_l + \dfrac{t-t_1}{t_2-t_1}\,(r_m-r_l), & t_1 < t \le t_2,\\[8pt]
+r_m + \min\!\Big(1,\,\dfrac{t-t_2}{T_f}\Big)\,(r_h-r_m), & t > t_2.
+\end{cases}
+$$
+
+**幅度反重建图**（log 幅度谱 + 圆盘 mask + 反变换取实部）：
+
+$$
+\mathcal{R}_{r(t)}(I)
+= \operatorname{Re}\!\Big(
+\mathcal{F}^{-1}\big(
+\mathcal{S}^{-1}\!\big[
+M_{r(t)} \odot \mathcal{S}\!\big[\log(1+|\mathcal{F}(I)|)\big]
+\big]
+\big)
+\Big),
+$$
+
+其中 $\mathcal{S}, \mathcal{S}^{-1}$ 是 `fftshift / ifftshift`。
+
+**幅度反重建损失**（单尺度 L1）：
+
+$$
+\mathcal{L}_{amp\_rec}(t)
+= \big\| \mathcal{R}_{r(t)}(\hat{I}) - \mathcal{R}_{r(t)}(I) \big\|_1.
+$$
+
+**总训练目标**：
+
+$$
+\mathcal{L}
+= (1-\lambda_{dssim})\,\mathcal{L}_{rgb}
++ \lambda_{dssim}\,(1-\mathrm{SSIM})
++ \lambda_{amp}\,\mathcal{L}_{amp\_rec}(t),
+$$
+
+默认 $\lambda_{amp} =$ `lambda_amp_rec = 0.5`（`arguments/__init__.py`）。其他默认超参：`amp_rec_mask_ratio_low = 0.15`、`amp_rec_mask_ratio_mid = 0.4`、`amp_rec_mask_ratio_high = 0.99`、`amp_rec_stage1_iter = 5000`、`amp_rec_stage2_iter = 12000`、`amp_rec_final_transition_len = 8000`。
+
+### 11.5.3 正则项作用
+
+- **频域能量约束**：在 log 压缩后的幅度谱上施加约束，再以 ifft 实部回到空间域用 L1 比较，等价于把"渲染图在当前监督频段内的能量分布"对齐到真值。可有效缓解 3DGS 重建偏模糊、缺纹理的问题，让幅度谱不会在中高频持续欠拟合。
+- **课程式 (progressive) 高频引入**：三段折线把"先稳低频几何、再纳入中频纹理、最后收紧高频细节"明确编码进 mask 半径里。早期 $t \le t_1$ 半径锁定在低频，避免训练早期梯度向噪声 / 伪影方向传播；中后期半径单调扩展到 $r_h$，逐步释放高频监督带宽。
+- **空间域 L1 的鲁棒性**：在反变换后的实部图上做 L1（而不是直接在频域做 L2），既保留 Parseval 等价性的物理含义，又对训练早期的轻微几何错位不像逐像素 L1 那样敏感；log 压缩则进一步降低少数高能频点对损失的支配，使损失梯度在不同频段更均衡。
+- **对 EAS / RFAS 的互补**：EAS / RFAS 是 densification 阶段的**评分**信号，决定哪些 Gaussian 被分裂；幅度反重建损失是直接作用在渲染像素的**端到端梯度**信号。两者一个改结构、一个改外观，在频域层面共同约束高频细节的还原。
+
+---
+
 ## 12. 总结
 
 在 3DGS 中使用渲染图像和真实图像的幅度反重建结果来计算损失是可行的。该损失可以作为一种频域辅助正则项，用于约束图像的频率能量分布和纹理强度。

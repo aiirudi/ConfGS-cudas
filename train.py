@@ -119,19 +119,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
-        #--------------------------- 加入 Freq Residual Regulation and FA-------------------------------
-        # 做 Conf 的消融，单独加一个conf 看看效果好不好
-        # 关闭 RFDAR
-        """
-        if iteration >= opt.regulation_convert_iter:
-            e_image = torch.abs(gt_image - image)
-            loss += compute_frequency_regularization(e_image, iteration, opt.regulation_convert_iter, w_l=lambda_efre_wl, w_h=lambda_efre_wh, 
-                                                     startI=opt.densify_from_iter, endI =opt.densify_until_iter,
-                                                     cutoff_ratio_low=0.15,cutoff_ratio_high=0.5)"""
-        #--------------------------- 加入 Freq Residual Regulation and FA-------------------------------
-        
+
+        # 加入 PAIR Loss (方案 B: 单圆盘 mask + 三段折线半径退火, 与论文公式对齐)
         if opt.lambda_amp_rec > 0:
-            amp_rec_mask_ratio = get_multiscale_amp_rec_mask_ratio(
+            r_t = get_multiscale_amp_rec_mask_ratio(
                 iteration,
                 stage1_iter=opt.amp_rec_stage1_iter,
                 stage2_iter=opt.amp_rec_stage2_iter,
@@ -140,33 +131,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 high_ratio=opt.amp_rec_mask_ratio_high,
                 final_transition_len=opt.amp_rec_final_transition_len,
             )
-            loss +=  opt.lambda_amp_rec * amplitude_reconstruction_loss(
-                image, gt_image,use_log=True,
-                mask_ratio=amp_rec_mask_ratio
+            # 权重调度: ≤14000 用原值, 14000→15000 线性退火至一半, >15000 保持一半
+            """
+            if iteration <= 14000:
+                lambda_amp_t = opt.lambda_amp_rec
+            elif iteration <= 15000:
+                t = (iteration - 14000) / 1000.0
+                lambda_amp_t = opt.lambda_amp_rec * (1.0 - 0.5 * t)
+            else:
+                lambda_amp_t = opt.lambda_amp_rec * 0.5
+            """
+            
+            loss += opt.lambda_amp_rec * amplitude_reconstruction_loss(
+                image, gt_image, use_log=True, mask_ratio=r_t,
             )
+
+
 
         loss.backward()
 
-        if iteration % 500 == 0:
-            with torch.no_grad():
-                current_psnr = psnr(image, gt_image).mean().item()
-                psnr_records.append({
-                    'iteration': iteration,
-                    'psnr': current_psnr
-                })
-                
-                # 打印当前记录
-                print(f"\n[ITER {iteration}] PSNR: {current_psnr:.2f}")
-                
-                # 打印完整的历史记录
-                print("\n=== Complete PSNR Records ===")
-                for record in psnr_records:
-                    print(f"Iteration {record['iteration']:5d}: PSNR = {record['psnr']:.2f} dB")
-                print("=" * 30 + "\n")
-
-
         iter_end.record()
-
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -211,16 +195,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     
                     
                     # 接下来计算 RFAS score
-                    gaussian_importance_rf = compute_rf_score(camlist, gaussians, pipe, bg)
+                    gaussian_importance_rf = compute_rf_score1(camlist, gaussians, pipe, bg)
                     #print('gaussian_importance_rf shape is ',gaussian_importance_rf.shape)
+                    
                     
                     tt_importance = fuse_importance_scores(
                         gaussian_importance, 
                         gaussian_importance_rf, 
-                        mode='product' 
+                        mode='weighted' 
                     )
-                    
-                    #tt_importance = gaussian_importance # 只启用 eas
+                   
+                    #tt_importance = gaussian_importance_rf # 只启用 rfas
 
                     startI = opt.densify_from_iter
                     endI = opt.densify_until_iter - 500
@@ -287,6 +272,7 @@ def normalize(value_tensor):
 
 #=========================================
 # 幅度反重建损失
+# 方案 B
 def get_multiscale_amp_rec_mask_ratio(
     iteration,
     stage1_iter=5000,
@@ -371,6 +357,78 @@ def amplitude_reconstruction_loss(
 
     return F.l1_loss(pred_map, gt_map)
 
+#=============================================================
+# 环带幅度
+# 方案 C
+def compute_amplitude_reconstruction_ring_map(image, r_lo, r_hi, use_log=True):
+    added_batch = False
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+        added_batch = True
+    
+    image = image.float()
+    _, _, h, w = image.shape
+
+    fft = torch.fft.fft2(image, dim=(-2, -1), norm="ortho")
+    amp = torch.abs(fft)
+    if use_log:
+        amp = torch.log1p(amp)
+    
+    amp = torch.fft.fftshift(amp, dim=(-2, -1))
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=image.device),
+        torch.arange(w, device=image.device),
+        indexing="ij" 
+    )
+    cy, cx = h // 2, w // 2
+    dist = torch.sqrt(((yy - cy) ** 2 + (xx - cx) ** 2).float())
+
+    max_dist = torch.sqrt(torch.tensor(
+        cx ** 2 + cy ** 2, device=image.device, dtype=torch.float32
+    ))
+    if r_lo <= 0:
+        mask = (dist <= r_hi * max_dist).float()
+    else:
+        mask = ((dist > r_lo * max_dist) & (dist <= r_hi * max_dist)).float()
+    mask = mask.view(1, 1, h, w)
+    amp = amp * mask
+    amp = torch.fft.ifftshift(amp, dim=(-2, -1))
+
+    amp_rec = torch.fft.ifft2(
+        amp.to(torch.complex64), dim=(-2, -1), norm="ortho"
+    ).real
+    if added_batch:
+        amp_rec = amp_rec.squeeze(0)
+    return amp_rec
+
+def amplitude_reconstruction_loss_ring(pred, gt, r_lo, r_hi, use_log=True):
+    pred_map = compute_amplitude_reconstruction_ring_map(pred, r_lo, r_hi, use_log)
+    gt_map  = compute_amplitude_reconstruction_ring_map(gt,   r_lo, r_hi, use_log)
+      # 用 mask 内频点数做归一化，让不同环带量纲一致
+    return F.l1_loss(pred_map, gt_map)
+
+def compute_amplitude_reconstruction_loss_multiscale(
+    pred, gt,
+    iteration,
+    band_iters=(0, 5000, 12000),
+    band_ratios=(0.15, 0.45, 0.9),
+    band_weights=(1.0, 1.0, 1.0),
+    use_log=True,
+  ):
+    losses = []
+    total_w = 0.0
+    for i, (start_iter, r_hi, w) in enumerate(
+        zip(band_iters, band_ratios, band_weights)):
+        if iteration < start_iter:
+            continue
+        r_lo = band_ratios[i-1] if i > 0 else 0.0
+        l = amplitude_reconstruction_loss_ring(pred, gt, r_lo, r_hi, use_log)
+        
+        losses.append(w * l)
+        total_w += w
+    if not losses:
+        return torch.tensor(0.0, device=pred.device)
+    return torch.stack(losses).sum() / total_w
 
 # ==================================== Fre Regulazation and FA ======================================
 def compute_frequency_discrepancies(e, iteration, T0, T_end, cutoff_ratio_low=0.15, cutoff_ratio_high=0.5):
@@ -485,7 +543,7 @@ def fuse_importance_scores(eas, rfas, mode='geometric', power=1.0):
         fused = eas_norm * rfas_norm
     elif mode == 'weighted':
         # 加权平均
-        alpha = 0.6
+        alpha = 0.4
         fused = alpha * eas_norm + (1 - alpha) * rfas_norm
     
     if power != 1.0:

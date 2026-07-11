@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 
 # 你只需要修改下面这一行的数据集路径
-DATASET="/workspace/dataset/mip_nerf360/garden"
+DATASET="/workspace/dataset/mipnerf/bicycle"
 
 # 完全按你的命令运行
-python train.py -s "$DATASET" --eval
+python train.py -s "$DATASET" -m output/bicycle --eval

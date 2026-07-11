@@ -451,7 +451,8 @@ class GaussianModel:
         
         # grad_qualifiers.shape: (N,)
         grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= min_grad, True, False)       
-
+        
+        
         # 计算冲突度, 关闭 conf
         conf = 1.0 - (torch.norm(self.xyz_gradient_vec_accum, dim=-1, keepdim=True)) / (self.xyz_gradient_mag_accum + 1e-6)
         conf[conf.isnan()] = 0.0
@@ -461,15 +462,8 @@ class GaussianModel:
         has_enough_views = (self.denom.squeeze(-1) >= min_views)  # (N,)
         conf_mask = (conf >= conf_thr)  # (N,)
         
-
         grad_qualifiers = grad_qualifiers & (has_enough_views & conf_mask) 
-        """
-        if limitation <= 1250000:
-            grad_qualifiers = grad_qualifiers & (has_enough_views & conf_mask) 
-        else:
-            grad_qualifiers = (grad_qualifiers | (has_enough_views & conf_mask))
-        """
-
+        
         total_sum = torch.sum(grad_qualifiers).item()
         curr_points = len(self.get_xyz)
         budget = min(budget, total_sum + curr_points)

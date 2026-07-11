@@ -93,7 +93,7 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
 
         #freq regulation parameter
-        self.lambda_efre_wl = 0.1
+        self.lambda_efre_wl = 0.05
         self.lambda_efre_wh = 0.1
         self.regulation_convert_iter = 0
 
@@ -103,7 +103,7 @@ class OptimizationParams(ParamGroup):
         self.amp_rec_stage2_iter = 12000
         self.amp_rec_mask_ratio_low = 0.15
         self.amp_rec_mask_ratio_mid = 0.4
-        self.amp_rec_mask_ratio_high = 0.9
+        self.amp_rec_mask_ratio_high = 0.90
         self.amp_rec_final_transition_len = 8000
 
 
@@ -113,7 +113,7 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         
         # mip-nerf360
-        self.budget = 3000_000
+        self.budget = 1300_000
         
         # Tanks & temples
         #self.budget = 125_0000

@@ -5,7 +5,9 @@ set -e
 cd "$(dirname "$0")"
 
 # 你只需要修改下面这一行的模型路径
-MODEL_DIR="/workspace/Improved-GS-main/output/garden2"
+MODEL_DIR="/workspace/RFGS/output/truck"
 
 # 完全按你的命令运行
 python render.py -m "$MODEL_DIR"
+
+python metrics.py -m "$MODEL_DIR"
