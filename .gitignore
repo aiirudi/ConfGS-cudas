@@ -3,3 +3,5 @@ output/
 __pycache__/
 output/
 .humanize*
+conf_alter_plan.md
+conf_jacobian_pullback.md
