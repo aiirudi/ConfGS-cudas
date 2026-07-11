@@ -2,3 +2,4 @@ output/
 *.md.humanize*
 __pycache__/
 output/
+.humanize*
