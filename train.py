@@ -175,6 +175,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
             # Save profiler data AFTER training_report (which captures latest PSNR)
             if opt.profile_components and iteration == opt.iterations:
+                # Force final test eval if not already in testing_iterations
+                if iteration not in testing_iterations:
+                    training_report(tb_writer, iteration, Ll1, loss, l1_loss,
+                                    iter_start.elapsed_time(iter_end), [iteration],
+                                    scene, render, (pipe, background))
                 import json as _json
                 n_gs = gaussians.get_xyz.shape[0]
                 prof_data = {

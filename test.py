@@ -58,16 +58,16 @@ for data, group, budget in paramList:
 
     # 3. SSIM and LPIPS (from metrics.py results.json)
     # results.json structure: {method: {"SSIM":..., "PSNR":..., "LPIPS":...}}
-    # where method is a subdirectory name under test/ (e.g. "ours_30000")
+    # method is e.g. "ours_30000" — select ours_* to avoid stale iter methods
     results_path = os.path.join(out, 'results.json')
     if os.path.exists(results_path):
         with open(results_path, 'r') as fp:
             results = json.load(fp)
-        # Grab the first method's metrics
         for method_name, method_metrics in results.items():
-            scene_metrics['SSIM'] = method_metrics.get('SSIM', 0.0)
-            scene_metrics['LPIPS'] = method_metrics.get('LPIPS', 0.0)
-            break
+            if method_name.startswith('ours_'):
+                scene_metrics['SSIM'] = method_metrics.get('SSIM', 0.0)
+                scene_metrics['LPIPS'] = method_metrics.get('LPIPS', 0.0)
+                break
 
     ALL_METRICS[data] = scene_metrics
     print(f"  Collected {data}: {scene_metrics}")
