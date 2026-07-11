@@ -471,8 +471,8 @@ class GaussianModel:
         has_enough_views = (self.xyz_gradient_conf_denom.squeeze(-1) >= min_views)  # (N,)
         conf_mask = (conf >= conf_thr)  # (N,)
         
-        grad_qualifiers = grad_qualifiers & (has_enough_views & conf_mask) 
-        
+        grad_qualifiers = grad_qualifiers & (has_enough_views & conf_mask)
+
         total_sum = torch.sum(grad_qualifiers).item()
         curr_points = len(self.get_xyz)
         budget = min(budget, total_sum + curr_points)
