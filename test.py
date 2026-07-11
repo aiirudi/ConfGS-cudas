@@ -65,7 +65,7 @@ for data, group, budget in paramList:
             results = json.load(fp)
         ours_methods = [m for m in results.keys() if m.startswith('ours_')]
         if ours_methods:
-            target = sorted(ours_methods)[-1]  # highest iteration
+            target = max(ours_methods, key=lambda m: int(m.split('_')[-1]))
             scene_metrics['SSIM'] = results[target].get('SSIM', 0.0)
             scene_metrics['LPIPS'] = results[target].get('LPIPS', 0.0)
 
