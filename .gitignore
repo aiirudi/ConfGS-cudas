@@ -1,2 +1,4 @@
 output/
 *.md.humanize*
+__pycache__/
+output/
