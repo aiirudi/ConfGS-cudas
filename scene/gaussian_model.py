@@ -45,6 +45,8 @@ class GaussianModel:
         # 新增计算 Conf 的梯度累积向量
         self.xyz_gradient_vec_accum = torch.empty(0)
         self.xyz_gradient_mag_accum = torch.empty(0)
+        # Conf valid-view counter (separate from scalar EAS denom)
+        self.xyz_gradient_conf_denom = torch.empty(0)
 
         # 新增分裂冷却计数器
         #self.split_cooldown = torch.empty(0) 
@@ -176,6 +178,7 @@ class GaussianModel:
         # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
         self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 3), device='cuda')
         self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
+        self.xyz_gradient_conf_denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
 
         # 初始化冷却计数器 (初始全部为0,表示可以立即参与分裂)
         #self.split_cooldown = torch.zeros((self.get_xyz.shape[0], 1), device='cuda', dtype=torch.int32)
@@ -342,6 +345,7 @@ class GaussianModel:
         # 同样对新加入 Conf 的统计量修改
         self.xyz_gradient_vec_accum = self.xyz_gradient_vec_accum[valid_points_mask]
         self.xyz_gradient_mag_accum = self.xyz_gradient_mag_accum[valid_points_mask]
+        self.xyz_gradient_conf_denom = self.xyz_gradient_conf_denom[valid_points_mask]
 
         # 同步修剪冷却计数器
         #self.split_cooldown = self.split_cooldown[valid_points_mask]
@@ -394,6 +398,7 @@ class GaussianModel:
         # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
         self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_conf_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         # 重置冷却计数器
         #self.split_cooldown = torch.zeros((self.get_xyz.shape[0],1), device="cuda", dtype=torch.int32)
@@ -426,6 +431,7 @@ class GaussianModel:
         # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
         self.xyz_gradient_vec_accum= torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_conf_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         # 重置冷却计数器
         #self.split_cooldown = torch.zeros((self.get_xyz.shape[0],1), device="cuda", dtype=torch.int32)
@@ -453,13 +459,16 @@ class GaussianModel:
         grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= min_grad, True, False)       
         
         
-        # 计算冲突度, 关闭 conf
+        # 计算冲突度
         conf = 1.0 - (torch.norm(self.xyz_gradient_vec_accum, dim=-1, keepdim=True)) / (self.xyz_gradient_mag_accum + 1e-6)
         conf[conf.isnan()] = 0.0
+        # Zero valid views: no meaningful gradient observations
+        zero_views = (self.xyz_gradient_conf_denom <= 0).squeeze(-1)
+        conf[zero_views] = 0.0
         conf = conf.squeeze(-1)  # (N,)
         min_views = getattr(opt, "conf_min_views", 3)
         conf_thr = getattr(opt, "conf_thr", 0.6)
-        has_enough_views = (self.denom.squeeze(-1) >= min_views)  # (N,)
+        has_enough_views = (self.xyz_gradient_conf_denom.squeeze(-1) >= min_views)  # (N,)
         conf_mask = (conf >= conf_thr)  # (N,)
         
         grad_qualifiers = grad_qualifiers & (has_enough_views & conf_mask) 
@@ -527,8 +536,8 @@ class GaussianModel:
         qy = clip[:, 1]  # (n,)
         qw = clip[:, 3]  # (n,)
 
-        # Exclude points at or behind the camera plane
-        safe_qw = torch.where(qw.abs() > eps, qw, torch.full_like(qw, eps))
+        # Exclude points at or behind the camera plane (positive clip_w convention)
+        safe_qw = torch.where(qw > eps, qw, torch.full_like(qw, eps))
 
         # Extract matrix columns for the xyz rows (indices 0,1,2) of the
         # projection-matrix rows that participate in ndc_x, ndc_y, and w.
@@ -546,15 +555,17 @@ class GaussianModel:
         jacobian = torch.stack([jac_x, jac_y], dim=1)  # (n, 2, 3)
         g_world_vis = torch.bmm(jacobian.transpose(1, 2), grad_ndc.unsqueeze(-1)).squeeze(-1)  # (n, 3)
 
-        # Validity: behind-camera, NaN, Inf
+        # Validity: front-camera (qw > 0), finite inputs and outputs
         valid_vis = (
-            (qw.abs() > eps)
-            & torch.isfinite(g_world_vis).all(dim=-1)
+            (qw > eps)
+            & torch.isfinite(qx) & torch.isfinite(qy) & torch.isfinite(qw)
             & torch.isfinite(grad_ndc).all(dim=-1)
+            & torch.isfinite(jacobian).reshape(grad_ndc.shape[0], -1).all(dim=-1)
+            & torch.isfinite(g_world_vis).all(dim=-1)
         )
 
         # Scatter back to full-size tensors
-        g_world = torch.zeros((N, 3), device=device, dtype=torch.float32)
+        g_world = torch.zeros((N, 3), device=device, dtype=xyz_world.dtype)
         valid = torch.zeros(N, device=device, dtype=torch.bool)
 
         g_world[update_filter] = g_world_vis
@@ -573,14 +584,16 @@ class GaussianModel:
         # 3D world-space vector and its norm.
         if viewpoint_cam is not None:
             g_ndc = viewspace_point_tensor.grad[idx, :2].detach()  # (n,2) dL/d(NDC_xy)
-            g_world, _valid = self._compute_ndc_vjp_world(
+            g_world, valid = self._compute_ndc_vjp_world(
                 self.get_xyz.detach(),
                 g_ndc,
                 idx,
                 viewpoint_cam.full_proj_transform,
             )
-            self.xyz_gradient_vec_accum[idx] += g_world[idx]
-            self.xyz_gradient_mag_accum[idx] += torch.norm(g_world[idx], dim=-1, keepdim=True)
+            # Only accumulate for Gaussians with valid world gradients
+            self.xyz_gradient_vec_accum[valid] += g_world[valid]
+            self.xyz_gradient_mag_accum[valid] += torch.norm(g_world[valid], dim=-1, keepdim=True)
+            self.xyz_gradient_conf_denom[valid] += 1
         else:
             # Fallback: original 2D NDC accumulation (backward compatibility)
             # Pad to 3D with zero z-component to match the (N,3) accumulator
@@ -588,7 +601,9 @@ class GaussianModel:
             g_pad = torch.cat([g, torch.zeros_like(g[:, :1])], dim=-1)  # (n,3)
             self.xyz_gradient_vec_accum[idx] += g_pad
             self.xyz_gradient_mag_accum[idx] += torch.norm(g, dim=-1, keepdim=True)
+            self.xyz_gradient_conf_denom[idx] += 1
 
+        # EAS scalar denom unchanged
         self.denom[idx] += 1
 
     # EAS 中的计算视角绝对值
@@ -602,14 +617,15 @@ class GaussianModel:
         # 3D world-space vector and its norm.
         if viewpoint_cam is not None:
             g_ndc = viewspace_point_tensor.grad[idx, :2].detach()  # (n,2) dL/d(NDC_xy)
-            g_world, _valid = self._compute_ndc_vjp_world(
+            g_world, valid = self._compute_ndc_vjp_world(
                 self.get_xyz.detach(),
                 g_ndc,
                 idx,
                 viewpoint_cam.full_proj_transform,
             )
-            self.xyz_gradient_vec_accum[idx] += g_world[idx]
-            self.xyz_gradient_mag_accum[idx] += torch.norm(g_world[idx], dim=-1, keepdim=True)
+            self.xyz_gradient_vec_accum[valid] += g_world[valid]
+            self.xyz_gradient_mag_accum[valid] += torch.norm(g_world[valid], dim=-1, keepdim=True)
+            self.xyz_gradient_conf_denom[valid] += 1
         else:
             # Fallback: original 2D NDC accumulation (backward compatibility)
             # Pad to 3D with zero z-component to match the (N,3) accumulator
@@ -617,7 +633,9 @@ class GaussianModel:
             g_pad = torch.cat([g, torch.zeros_like(g[:, :1])], dim=-1)  # (n,3)
             self.xyz_gradient_vec_accum[idx] += g_pad
             self.xyz_gradient_mag_accum[idx] += torch.norm(g, dim=-1, keepdim=True)
+            self.xyz_gradient_conf_denom[idx] += 1
 
+        # EAS scalar denom unchanged
         self.denom[idx] += 1
 
     # LAS 实现: 按 score 加权（multinomial）从可分裂候选中采 budget 个父高斯，
