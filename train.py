@@ -71,6 +71,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
     first_iter += 1
     bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+    # Profiling accumulators for user-added components
+    from collections import defaultdict
+    stage_times = defaultdict(float)
+    stage_counts = defaultdict(int)
+    stage_memory = defaultdict(float)
+
     lambda_efre_wl, lambda_efre_wh = opt.lambda_efre_wl, opt.lambda_efre_wh
 
     init_point_nums = gaussians.get_xyz.shape[0]
@@ -121,30 +127,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         
 
         # 加入 PAIR Loss (方案 B: 单圆盘 mask + 三段折线半径退火, 与论文公式对齐)
-        if opt.lambda_amp_rec > 0:
-            r_t = get_multiscale_amp_rec_mask_ratio(
-                iteration,
-                stage1_iter=opt.amp_rec_stage1_iter,
-                stage2_iter=opt.amp_rec_stage2_iter,
-                low_ratio=opt.amp_rec_mask_ratio_low,
-                mid_ratio=opt.amp_rec_mask_ratio_mid,
-                high_ratio=opt.amp_rec_mask_ratio_high,
-                final_transition_len=opt.amp_rec_final_transition_len,
-            )
-            # 权重调度: ≤14000 用原值, 14000→15000 线性退火至一半, >15000 保持一半
-            """
-            if iteration <= 14000:
-                lambda_amp_t = opt.lambda_amp_rec
-            elif iteration <= 15000:
-                t = (iteration - 14000) / 1000.0
-                lambda_amp_t = opt.lambda_amp_rec * (1.0 - 0.5 * t)
-            else:
-                lambda_amp_t = opt.lambda_amp_rec * 0.5
-            """
+        # if opt.lambda_amp_rec > 0:
+        #     r_t = get_multiscale_amp_rec_mask_ratio(
+        #         iteration,
+        #         stage1_iter=opt.amp_rec_stage1_iter,
+        #         stage2_iter=opt.amp_rec_stage2_iter,
+        #         low_ratio=opt.amp_rec_mask_ratio_low,
+        #         mid_ratio=opt.amp_rec_mask_ratio_mid,
+        #         high_ratio=opt.amp_rec_mask_ratio_high,
+        #         final_transition_len=opt.amp_rec_final_transition_len,
+        #     )
+        #     # 权重调度: ≤14000 用原值, 14000→15000 线性退火至一半, >15000 保持一半
+        #     """
+        #     if iteration <= 14000:
+        #         lambda_amp_t = opt.lambda_amp_rec
+        #     elif iteration <= 15000:
+        #         t = (iteration - 14000) / 1000.0
+        #         lambda_amp_t = opt.lambda_amp_rec * (1.0 - 0.5 * t)
+        #     else:
+        #         lambda_amp_t = opt.lambda_amp_rec * 0.5
+        #     """
             
-            loss += opt.lambda_amp_rec * amplitude_reconstruction_loss(
-                image, gt_image, use_log=True, mask_ratio=r_t,
-            )
+        #     loss += opt.lambda_amp_rec * amplitude_reconstruction_loss(
+        #         image, gt_image, use_log=True, mask_ratio=r_t,
+        #     )
 
 
 
@@ -160,6 +166,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             if iteration == opt.iterations:
                 progress_bar.close()
 
+                # Print profiler summary for user-added components
+                if opt.profile_components:
+                    total_time = sum(stage_times.values())
+                    print("\n=== Component Profiling Summary ===")
+                    print(f"{'Component':<12} {'Time(ms)':<12} {'%Total':<10} {'Calls':<10} {'MemΔ(MB)':<12}")
+                    print("-" * 56)
+                    for comp in ['conf', 'rfas', 'fusion']:
+                        t = stage_times.get(comp, 0.0)
+                        c = stage_counts.get(comp, 0)
+                        m = stage_memory.get(comp, 0.0)
+                        pct = (t / total_time * 100) if total_time > 0 else 0.0
+                        print(f"{comp:<12} {t:<12.2f} {pct:<10.2f} {c:<10} {m/1024/1024:<12.2f}")
+                    print(f"{'TOTAL':<12} {total_time:<12.2f} {'100.00':<10}")
+                    print("==================================\n")
+
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if iteration in saving_iterations:
@@ -171,11 +192,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
             # Densification
             if opt.densify_from_iter < iteration < opt.densify_until_iter:
-                
+
+                # --- Conf timing probe ---
+                if opt.profile_components:
+                    torch.cuda.synchronize()
+                    start_conf = torch.cuda.Event(enable_timing=True)
+                    end_conf = torch.cuda.Event(enable_timing=True)
+                    start_conf.record()
+                    mem_before_conf = torch.cuda.max_memory_allocated()
+
                 # EAS 中计算
                 gaussians.add_densification_stats_abs(viewspace_point_tensor, visibility_filter, viewpoint_cam)
 
-                if iteration % opt.densification_interval == 0:     
+                if opt.profile_components:
+                    end_conf.record()
+                    torch.cuda.synchronize()
+                    mem_after_conf = torch.cuda.max_memory_allocated()
+                    stage_times['conf'] += start_conf.elapsed_time(end_conf)
+                    stage_counts['conf'] += 1
+                    stage_memory['conf'] += (mem_after_conf - mem_before_conf)
+
+                if iteration % opt.densification_interval == 0:
                     # 默认用 args.cams 个视角来计算重要性
                     num_cams = args.cams
                     if args.cams == -1 or (iteration % 3000 == 400 and iteration < 9000):
@@ -188,23 +225,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                             edges_stack = all_edges.copy()
                         camlist.append(my_viewpoint_stack.pop())
                         edge_losses.append(edges_stack.pop())
-                    
+
                     # 计算 EAS score gaussian_importance.shape: (N,)
                     gaussian_importance = compute_edge_score(camlist, edge_losses, gaussians, pipe, bg)
                     #print('gaussian_imortance shape is ',gaussian_importance.shape)
-                    
-                    
+
+                    # --- RFAS timing probe ---
+                    if opt.profile_components:
+                        torch.cuda.synchronize()
+                        start_rfas = torch.cuda.Event(enable_timing=True)
+                        end_rfas = torch.cuda.Event(enable_timing=True)
+                        start_rfas.record()
+                        mem_before_rfas = torch.cuda.max_memory_allocated()
+
                     # 接下来计算 RFAS score
                     gaussian_importance_rf = compute_rf_score1(camlist, gaussians, pipe, bg)
                     #print('gaussian_importance_rf shape is ',gaussian_importance_rf.shape)
-                    
-                    
+
+                    if opt.profile_components:
+                        end_rfas.record()
+                        torch.cuda.synchronize()
+                        mem_after_rfas = torch.cuda.max_memory_allocated()
+                        stage_times['rfas'] += start_rfas.elapsed_time(end_rfas)
+                        stage_counts['rfas'] += 1
+                        stage_memory['rfas'] += (mem_after_rfas - mem_before_rfas)
+
+                    # --- Fusion timing probe ---
+                    if opt.profile_components:
+                        torch.cuda.synchronize()
+                        start_fusion = torch.cuda.Event(enable_timing=True)
+                        end_fusion = torch.cuda.Event(enable_timing=True)
+                        start_fusion.record()
+                        mem_before_fusion = torch.cuda.max_memory_allocated()
+
                     tt_importance = fuse_importance_scores(
-                        gaussian_importance, 
-                        gaussian_importance_rf, 
-                        mode='weighted' 
+                        gaussian_importance,
+                        gaussian_importance_rf,
+                        mode='weighted'
                     )
-                   
+
                     #tt_importance = gaussian_importance_rf # 只启用 rfas
 
                     startI = opt.densify_from_iter
@@ -218,6 +277,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
                     # LAS 入口, 最后再densify_and_prune_Improved 中调用 LAS
                     gaussians.densify_and_prune_Improved(tt_importance, 0.005, budget, opt, iteration, opt.budget)
+
+                    if opt.profile_components:
+                        end_fusion.record()
+                        torch.cuda.synchronize()
+                        mem_after_fusion = torch.cuda.max_memory_allocated()
+                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
+                        stage_counts['fusion'] += 1
+                        stage_memory['fusion'] += (mem_after_fusion - mem_before_fusion)
                 
             
                 if iteration % opt.opacity_reset_interval == 0:
@@ -719,6 +786,13 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        # Per-component stage times (logged at densification interval for sparse components)
+        for comp in ['conf', 'rfas', 'fusion']:
+            if stage_counts.get(comp, 0) > 0:
+                tb_writer.add_scalar('stage_time/' + comp,
+                    stage_times[comp] / max(stage_counts[comp], 1), iteration)
+                tb_writer.add_scalar('memory/' + comp,
+                    stage_memory[comp] / max(stage_counts[comp], 1), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:

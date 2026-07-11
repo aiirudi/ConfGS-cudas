@@ -124,7 +124,10 @@ class OptimizationParams(ParamGroup):
         self.conf_min_views = 3
         self.conf_thr = 0.8
 
-        # 门控冷却 iter 数        
+        # Profiling flag
+        self.profile_components = False
+
+        # 门控冷却 iter 数
         super().__init__(parser, "Optimization Parameters")
 
 
