@@ -170,22 +170,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     print(f"{'TOTAL':<12} {total_time:<12.2f} {'100.00':<10}")
                     print("==================================\n")
 
-                    # Save profiler data to JSON for downstream collection
-                    import json as _json
-                    n_gs = gaussians.get_xyz.shape[0]
-                    prof_data = {
-                        'n_gaussians': n_gs,
-                        'psnr': training_report_psnr,
-                        'conf_time': stage_times.get('conf', 0.0),
-                        'rfas_time': stage_times.get('rfas', 0.0),
-                        'fusion_time': stage_times.get('fusion', 0.0),
-                    }
-                    prof_path = os.path.join(args.model_path, 'profiler_results.json')
-                    with open(prof_path, 'w') as fp:
-                        _json.dump(prof_data, fp, indent=True)
-
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+
+            # Save profiler data AFTER training_report (which captures latest PSNR)
+            if opt.profile_components and iteration == opt.iterations:
+                import json as _json
+                n_gs = gaussians.get_xyz.shape[0]
+                prof_data = {
+                    'n_gaussians': n_gs,
+                    'psnr': training_report_psnr,
+                    'conf_time': stage_times.get('conf', 0.0),
+                    'rfas_time': stage_times.get('rfas', 0.0),
+                    'fusion_time': stage_times.get('fusion', 0.0),
+                }
+                prof_path = os.path.join(dataset.model_path, 'profiler_results.json')
+                with open(prof_path, 'w') as fp:
+                    _json.dump(prof_data, fp, indent=True)
 
             # Per-component stage time logging (in training() scope where accumulators live)
             if tb_writer and opt.profile_components:
