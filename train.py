@@ -197,7 +197,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     start_conf = torch.cuda.Event(enable_timing=True)
                     end_conf = torch.cuda.Event(enable_timing=True)
                     start_conf.record()
-                    mem_before_conf = torch.cuda.max_memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
 
                 # EAS 中计算
                 gaussians.add_densification_stats_abs(viewspace_point_tensor, visibility_filter, viewpoint_cam)
@@ -205,10 +205,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                 if opt.profile_components:
                     end_conf.record()
                     torch.cuda.synchronize()
-                    mem_after_conf = torch.cuda.max_memory_allocated()
                     stage_times['conf'] += start_conf.elapsed_time(end_conf)
                     stage_counts['conf'] += 1
-                    stage_memory['conf'] += (mem_after_conf - mem_before_conf)
+                    stage_memory['conf'] += torch.cuda.max_memory_allocated()
 
                 if iteration % opt.densification_interval == 0:
                     # 默认用 args.cams 个视角来计算重要性
@@ -234,7 +233,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         start_rfas = torch.cuda.Event(enable_timing=True)
                         end_rfas = torch.cuda.Event(enable_timing=True)
                         start_rfas.record()
-                        mem_before_rfas = torch.cuda.max_memory_allocated()
+                        torch.cuda.reset_peak_memory_stats()
 
                     # 接下来计算 RFAS score
                     gaussian_importance_rf = compute_rf_score1(camlist, gaussians, pipe, bg)
@@ -243,10 +242,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     if opt.profile_components:
                         end_rfas.record()
                         torch.cuda.synchronize()
-                        mem_after_rfas = torch.cuda.max_memory_allocated()
                         stage_times['rfas'] += start_rfas.elapsed_time(end_rfas)
                         stage_counts['rfas'] += 1
-                        stage_memory['rfas'] += (mem_after_rfas - mem_before_rfas)
+                        stage_memory['rfas'] += torch.cuda.max_memory_allocated()
 
                     # --- Fusion timing probe ---
                     if opt.profile_components:
@@ -254,7 +252,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         start_fusion = torch.cuda.Event(enable_timing=True)
                         end_fusion = torch.cuda.Event(enable_timing=True)
                         start_fusion.record()
-                        mem_before_fusion = torch.cuda.max_memory_allocated()
+                        torch.cuda.reset_peak_memory_stats()
 
                     tt_importance = fuse_importance_scores(
                         gaussian_importance,
@@ -279,10 +277,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     if opt.profile_components:
                         end_fusion.record()
                         torch.cuda.synchronize()
-                        mem_after_fusion = torch.cuda.max_memory_allocated()
                         stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
                         stage_counts['fusion'] += 1
-                        stage_memory['fusion'] += (mem_after_fusion - mem_before_fusion)
+                        stage_memory['fusion'] += torch.cuda.max_memory_allocated()
                 
             
                 if iteration % opt.opacity_reset_interval == 0:
