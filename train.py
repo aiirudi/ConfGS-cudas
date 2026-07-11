@@ -170,6 +170,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     print(f"{'TOTAL':<12} {total_time:<12.2f} {'100.00':<10}")
                     print("==================================\n")
 
+                    # Save profiler data to JSON for downstream collection
+                    import json as _json
+                    n_gs = gaussians.get_xyz.shape[0]
+                    prof_data = {
+                        'n_gaussians': n_gs,
+                        'psnr': training_report_psnr,
+                        'conf_time': stage_times.get('conf', 0.0),
+                        'rfas_time': stage_times.get('rfas', 0.0),
+                        'fusion_time': stage_times.get('fusion', 0.0),
+                    }
+                    prof_path = os.path.join(args.model_path, 'profiler_results.json')
+                    with open(prof_path, 'w') as fp:
+                        _json.dump(prof_data, fp, indent=True)
+
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
 
@@ -779,7 +793,11 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 
+# Module-level: captured training test PSNR for downstream collection
+training_report_psnr = 0.0
+
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    global training_report_psnr
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -807,6 +825,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if config['name'] == 'test':
+                    training_report_psnr = psnr_test
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
