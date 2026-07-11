@@ -58,16 +58,16 @@ for data, group, budget in paramList:
 
     # 3. SSIM and LPIPS (from metrics.py results.json)
     # results.json structure: {method: {"SSIM":..., "PSNR":..., "LPIPS":...}}
-    # method is e.g. "ours_30000" — select ours_* to avoid stale iter methods
+    # Select the ours_* method with the highest iteration (most recent render)
     results_path = os.path.join(out, 'results.json')
     if os.path.exists(results_path):
         with open(results_path, 'r') as fp:
             results = json.load(fp)
-        for method_name, method_metrics in results.items():
-            if method_name.startswith('ours_'):
-                scene_metrics['SSIM'] = method_metrics.get('SSIM', 0.0)
-                scene_metrics['LPIPS'] = method_metrics.get('LPIPS', 0.0)
-                break
+        ours_methods = [m for m in results.keys() if m.startswith('ours_')]
+        if ours_methods:
+            target = sorted(ours_methods)[-1]  # highest iteration
+            scene_metrics['SSIM'] = results[target].get('SSIM', 0.0)
+            scene_metrics['LPIPS'] = results[target].get('LPIPS', 0.0)
 
     ALL_METRICS[data] = scene_metrics
     print(f"  Collected {data}: {scene_metrics}")
