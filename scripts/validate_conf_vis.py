@@ -32,6 +32,7 @@ REQUIRED_METADATA_FIELDS = [
 SCORE_NAME_MAP = {
     'conf': 'conf_score',
     'final_candidates': 'selection_score',
+    'abs': 'abs_score',
 }
 
 
@@ -66,7 +67,7 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
     # 收集文件
     files = sorted(os.listdir(vis_dir))
     render_files = {f for f in files if f.endswith('_render.png')}
-    overlay_files = {f for f in files if f.endswith('_conf.png') or f.endswith('_final_candidates.png')}
+    overlay_files = {f for f in files if f.endswith('_conf.png') or f.endswith('_final_candidates.png') or f.endswith('_abs.png')}
     indices_files = {f for f in files if f.endswith('_indices.pt')}
     metadata_path = os.path.join(vis_dir, "metadata.jsonl")
 

@@ -145,11 +145,12 @@ def save_visualization_pair(render_tensor, annotated_pil, output_dir,
 
 def save_conf_visualization(gaussians, conf_mask, conf_score,
                             final_mask, selection_score,
-                            vis_context, opt):
+                            vis_context, opt,
+                            abs_mask=None, abs_score=None):
     """Conf 候选点可视化的顶层入口。
 
     在 densify_and_prune_Improved() 中 final_mask 确定后、long_axis_split() 前调用。
-    快照当前 Gaussian 状态，投影 Conf 选中的中心到指定相机视图，绘制红点并保存。
+    快照当前 Gaussian 状态，投影选中的中心到指定相机视图，绘制红点并保存。
 
     Args:
         gaussians: GaussianModel 实例
@@ -160,6 +161,8 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
         vis_context: dict with keys:
             model_path, camera, render_image, iteration
         opt: OptimizationParams (包含可视化配置)
+        abs_mask: (N,) bool or None — abs-grad 布尔掩码
+        abs_score: (N, 1) or (N,) or None — abs-grad 分数
     """
     model_path = vis_context['model_path']
     camera = vis_context['camera']
@@ -182,6 +185,18 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
         conf_score_snapshot = conf_score.detach().clone()
         selection_score_snapshot = selection_score.detach().clone()
 
+        abs_mask_snapshot = None
+        abs_score_snapshot = None
+        if abs_mask is not None:
+            abs_mask_snapshot = abs_mask.detach().bool().clone()
+            assert abs_mask_snapshot.ndim == 1
+            assert abs_mask_snapshot.shape[0] == num_gaussians
+        if abs_score is not None:
+            abs_score_s = abs_score.detach().clone()
+            if abs_score_s.dim() > 1:
+                abs_score_s = abs_score_s.squeeze()
+            abs_score_snapshot = abs_score_s
+
         strategy = getattr(opt, 'candidate_selection_strategy', 'and')
 
     # ---- 按 mask_type 选择目标 mask 和对应 score ----
@@ -190,11 +205,14 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
     file_prefix = f"iteration_{iteration:06d}_view{camera_uid}"
 
     # score 名称映射 (用于 metadata 和 Top-K 标注)
-    score_name_map = {'conf': 'conf_score', 'final_candidates': 'selection_score'}
+    score_name_map = {'conf': 'conf_score', 'final_candidates': 'selection_score',
+                      'abs': 'abs_score'}
 
     mask_types_to_process = []
     if mask_type == 'both':
-        mask_types_to_process = ['conf', 'final_candidates']
+        mask_types_to_process = ['conf', 'final_candidates', 'abs']
+    elif mask_type == 'all':
+        mask_types_to_process = ['conf', 'final_candidates', 'abs']
     else:
         mask_types_to_process = [mask_type]
 
@@ -220,6 +238,12 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
             target_mask = final_mask_snapshot
             target_score = selection_score_snapshot
             type_suffix = 'final_candidates'
+        elif current_type == 'abs':
+            if abs_mask_snapshot is None:
+                continue
+            target_mask = abs_mask_snapshot
+            target_score = abs_score_snapshot if abs_score_snapshot is not None else torch.zeros(num_gaussians, device=abs_mask_snapshot.device)
+            type_suffix = 'abs'
         else:
             continue
 

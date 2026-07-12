@@ -528,6 +528,7 @@ class GaussianModel:
                 self, conf_mask, conf,
                 final_mask, selection_score,
                 vis_context, opt,
+                abs_mask=abs_mask, abs_score=grad_vars,
             )
 
         if all_budget > 0:

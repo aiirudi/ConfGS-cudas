@@ -265,7 +265,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     vis_context = None
                     if getattr(opt, 'visualize_conf', False):
                         # 验证 mask_type (拒绝无效值, 避免静默跳过可视化)
-                        valid_mask_types = {'conf', 'final_candidates', 'both'}
+                        valid_mask_types = {'conf', 'final_candidates', 'both', 'abs', 'all'}
                         mask_type = getattr(opt, 'conf_vis_mask_type', 'conf')
                         if mask_type not in valid_mask_types:
                             raise ValueError(
