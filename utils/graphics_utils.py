@@ -28,6 +28,24 @@ def geom_transform_points(points, transf_matrix):
     denom = points_out[..., 3:] + 0.0000001
     return (points_out[..., :3] / denom).squeeze(dim=0)
 
+def ndc_to_pixel(ndc_xy, width, height):
+    """将 NDC 坐标映射为像素坐标，精确复制 CUDA ndc2Pix 公式。
+
+    CUDA 公式 (auxiliary.h:41):
+        pix = ((v + 1.0) * S - 1.0) * 0.5
+
+    Args:
+        ndc_xy: (P, 2) NDC xy 坐标，值域 [-1, 1]
+        width:  图像宽度 (像素)
+        height: 图像高度 (像素)
+
+    Returns:
+        (P, 2) 像素坐标 (x, y)，x ∈ [0, width), y ∈ [0, height)
+    """
+    size = torch.tensor([width, height], dtype=ndc_xy.dtype, device=ndc_xy.device)
+    pix_xy = ((ndc_xy + 1.0) * size - 1.0) * 0.5
+    return pix_xy
+
 def getWorld2View(R, t):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = R.transpose()

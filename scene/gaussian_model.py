@@ -441,7 +441,7 @@ class GaussianModel:
     
         torch.cuda.empty_cache()
     
-    def densify_and_prune_Improved(self, scores, min_opacity, budget, opt, iteration, limitation, residual_offsets=None, rfas_score=None):
+    def densify_and_prune_Improved(self, scores, min_opacity, budget, opt, iteration, limitation, residual_offsets=None, rfas_score=None, vis_context=None):
         # grad_vars.shape: (N, 1)
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -514,6 +514,16 @@ class GaussianModel:
         budget = min(budget, total_sum + curr_points)
         all_budget = budget - curr_points
         num_split = 0
+
+        # Conf 候选点可视化 hook: 在 interval 累计统计完成后、Gaussian 数量变化前生成快照和标注图
+        # 红点来自完整 densification interval 内的累计 Conf 统计，不是单步瞬时结果
+        if vis_context is not None:
+            from utils.conf_visualization import save_conf_visualization
+            save_conf_visualization(
+                self, conf_mask, conf,
+                final_mask, selection_score,
+                vis_context, opt,
+            )
 
         if all_budget > 0:
             self.long_axis_split(

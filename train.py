@@ -261,7 +261,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         budget = int(math.sqrt(rate) * opt.budget)
 
                     # LAS 入口, 最后再densify_and_prune_Improved 中调用 LAS
-                    gaussians.densify_and_prune_Improved(tt_importance, 0.005, budget, opt, iteration, opt.budget, rfas_score=gaussian_importance_rf)
+                    # 构造可视化上下文 (仅在启用且当前 iteration 命中时)
+                    vis_context = None
+                    if getattr(opt, 'visualize_conf', False):
+                        should_vis = False
+                        trigger_reason = ""
+                        if getattr(opt, 'conf_vis_all_intervals', False):
+                            should_vis = True
+                            trigger_reason = "all_intervals"
+                        elif getattr(opt, 'conf_vis_iterations', ""):
+                            vis_iters = [int(x) for x in opt.conf_vis_iterations.split()]
+                            if iteration in vis_iters:
+                                should_vis = True
+                                trigger_reason = "explicit_iteration"
+                        else:
+                            # 默认: 只在最后一个有效 densification interval 保存一次
+                            next_interval = iteration + opt.densification_interval
+                            if next_interval >= opt.densify_until_iter:
+                                should_vis = True
+                                trigger_reason = "default_last_interval"
+
+                        if should_vis:
+                            vis_context = {
+                                'model_path': args.model_path,
+                                'camera': viewpoint_cam,
+                                'render_image': image.detach(),
+                                'iteration': iteration,
+                                'trigger_reason': trigger_reason,
+                            }
+
+                    gaussians.densify_and_prune_Improved(
+                        tt_importance, 0.005, budget, opt, iteration, opt.budget,
+                        rfas_score=gaussian_importance_rf,
+                        vis_context=vis_context,
+                    )
 
                     # 候选选择统计日志
                     if getattr(opt, 'candidate_stats_enabled', True):
