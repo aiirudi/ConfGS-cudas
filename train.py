@@ -264,6 +264,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     # 构造可视化上下文 (仅在启用且当前 iteration 命中时)
                     vis_context = None
                     if getattr(opt, 'visualize_conf', False):
+                        # 验证 mask_type (拒绝无效值, 避免静默跳过可视化)
+                        valid_mask_types = {'conf', 'final_candidates', 'both'}
+                        mask_type = getattr(opt, 'conf_vis_mask_type', 'conf')
+                        if mask_type not in valid_mask_types:
+                            raise ValueError(
+                                f"Invalid --conf_vis_mask_type '{mask_type}'. "
+                                f"Valid options: {sorted(valid_mask_types)}"
+                            )
+
                         should_vis = False
                         trigger_reason = ""
                         if getattr(opt, 'conf_vis_all_intervals', False):
