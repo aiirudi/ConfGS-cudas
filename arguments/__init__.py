@@ -124,6 +124,45 @@ class OptimizationParams(ParamGroup):
         self.conf_min_views = 3
         self.conf_thr = 0.8
 
+        # ---- 候选点选择策略参数 ----
+        # 策略选择: and | or | abs_only | conf_only | weighted_score | soft_fusion | rfas_rank
+        self.candidate_selection_strategy = 'and'
+        # 预算模式: native | fixed
+        self.candidate_budget_mode = 'native'
+        # fixed 预算参考: fixed_number | fixed_ratio | match_and
+        self.candidate_budget_reference = 'match_and'
+        # fixed_number 模式下的固定数量
+        self.candidate_fixed_budget = 1000
+        # fixed_ratio 模式下的比例
+        self.candidate_fixed_ratio = 0.05
+
+        # weighted_score / soft_fusion 融合权重 alpha
+        self.candidate_weight_alpha = 0.5
+        # 归一化方式: minmax | zscore | percentile
+        self.candidate_score_normalization = 'percentile'
+        # 连续分数的选择方式: threshold | topk
+        self.candidate_score_selection = 'topk'
+        # threshold 模式的阈值
+        self.candidate_score_threshold = 0.5
+        # topk 模式的绝对数量 (0 = 使用 ratio)
+        self.candidate_topk = 0
+        # topk 模式的比例 (candidate_topk > 0 时优先使用 absolute)
+        self.candidate_topk_ratio = 0.05
+
+        # soft_fusion 参数
+        # 融合方式: weighted | soft_and | soft_or
+        self.soft_fusion_type = 'weighted'
+        self.soft_abs_temperature = 1.0
+        self.soft_conf_temperature = 1.0
+        self.soft_selection_threshold = 0.5
+
+        # rfas_rank 参数
+        self.candidate_rfas_topk = 0
+        self.candidate_rfas_topk_ratio = 0.05
+
+        # 统计日志
+        self.candidate_stats_enabled = True
+
         # Profiling flag
         self.profile_components = False
 

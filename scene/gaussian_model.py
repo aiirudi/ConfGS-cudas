@@ -13,6 +13,7 @@ import math
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, identity_gate
+from utils.candidate_selector import select_densification_candidates
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -47,6 +48,8 @@ class GaussianModel:
         self.xyz_gradient_mag_accum = torch.empty(0)
         # Conf valid-view counter (separate from scalar EAS denom)
         self.xyz_gradient_conf_denom = torch.empty(0)
+        # 候选选择统计（每次 densification 时更新）
+        self.candidate_stats = {}
 
         # 新增分裂冷却计数器
         #self.split_cooldown = torch.empty(0) 
@@ -438,7 +441,7 @@ class GaussianModel:
     
         torch.cuda.empty_cache()
     
-    def densify_and_prune_Improved(self, scores, min_opacity, budget, opt, iteration, limitation,residual_offsets=None):
+    def densify_and_prune_Improved(self, scores, min_opacity, budget, opt, iteration, limitation, residual_offsets=None, rfas_score=None):
         # grad_vars.shape: (N, 1)
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -455,10 +458,9 @@ class GaussianModel:
             if scores.dim() > 1:
                 scores = scores.squeeze()
         
-        # grad_qualifiers.shape: (N,)
-        grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= min_grad, True, False)       
-        
-        
+        # 计算 abs-grad 布尔掩码
+        abs_mask = torch.where(torch.norm(grad_vars, dim=-1) >= min_grad, True, False)
+
         # 计算冲突度
         conf = 1.0 - (torch.norm(self.xyz_gradient_vec_accum, dim=-1, keepdim=True)) / (self.xyz_gradient_mag_accum + 1e-6)
         conf[conf.isnan()] = 0.0
@@ -467,27 +469,49 @@ class GaussianModel:
         conf[zero_views] = 0.0
         conf = conf.squeeze(-1)  # (N,)
         min_views = getattr(opt, "conf_min_views", 3)
-        conf_thr = getattr(opt, "conf_thr", 0.6)
+        conf_thr = getattr(opt, "conf_thr", 0.8)
         has_enough_views = (self.xyz_gradient_conf_denom.squeeze(-1) >= min_views)  # (N,)
-        conf_mask = (conf >= conf_thr)  # (N,)
-        
-        grad_qualifiers = grad_qualifiers & (has_enough_views & conf_mask)
+        conf_mask_raw = (conf >= conf_thr)  # (N,)
+        # conf_mask 始终包含 has_enough_views
+        conf_mask = conf_mask_raw & has_enough_views
 
-        total_sum = torch.sum(grad_qualifiers).item()
+        # 候选点选择策略（仅 iter <= 14500 使用；之后回退到原始 abs-grad 行为）
+        strategy = getattr(opt, "candidate_selection_strategy", "and")
+        if iteration > 14500:
+            # post-14500 统一回退：abs_mask 作 filter，grad_vars 作 scores
+            final_mask = abs_mask
+            selection_score = scores
+            self.candidate_stats = {
+                'strategy': 'and (fallback)',
+                'iteration': iteration,
+            }
+        else:
+            # rfas_score 回退到 scores（融合分数），若未传入原始 RFAS
+            _rfas = rfas_score if rfas_score is not None else scores
+            final_mask, selection_score, _stats = select_densification_candidates(
+                abs_score=grad_vars,
+                conf_score=conf,
+                rfas_score=_rfas,
+                abs_mask=abs_mask,
+                conf_mask=conf_mask,
+                strategy=strategy,
+                config=opt,
+            )
+            self.candidate_stats = _stats
+            self.candidate_stats['iteration'] = iteration
+
+        total_sum = torch.sum(final_mask).item()
         curr_points = len(self.get_xyz)
         budget = min(budget, total_sum + curr_points)
         all_budget = budget - curr_points
-        
+
         if all_budget > 0:
-            """
-            self.long_axis_split(scores.clone(), all_budget, grad_qualifiers, opt.split_distance, opt.opacity_reduction, cooldown_iters=cooldown_iters)
-            """
             self.long_axis_split(
-                scores.clone(), 
-                all_budget, 
-                grad_qualifiers, 
-                opt.split_distance, 
-                opt.opacity_reduction, 
+                selection_score.clone(),
+                all_budget,
+                final_mask,
+                opt.split_distance,
+                opt.opacity_reduction,
             )
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()

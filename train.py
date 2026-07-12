@@ -261,7 +261,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         budget = int(math.sqrt(rate) * opt.budget)
 
                     # LAS 入口, 最后再densify_and_prune_Improved 中调用 LAS
-                    gaussians.densify_and_prune_Improved(tt_importance, 0.005, budget, opt, iteration, opt.budget)
+                    gaussians.densify_and_prune_Improved(tt_importance, 0.005, budget, opt, iteration, opt.budget, rfas_score=gaussian_importance_rf)
+
+                    # 候选选择统计日志
+                    if getattr(opt, 'candidate_stats_enabled', True):
+                        stats = gaussians.candidate_stats
+                        if stats and 'strategy' in stats:
+                            import csv
+                            stats_path = os.path.join(args.model_path, "candidate_selection_stats.csv")
+                            fieldnames = [
+                                'iteration', 'strategy',
+                                'n_valid', 'n_abs_candidates', 'n_conf_candidates',
+                                'n_and_candidates', 'n_or_candidates', 'n_final_candidates',
+                                'candidate_ratio', 'target_budget', 'actual_budget',
+                                'abs_mean', 'abs_std', 'abs_median', 'abs_min', 'abs_max',
+                                'conf_mean', 'conf_std', 'conf_median', 'conf_min', 'conf_max',
+                                'rfas_mean', 'rfas_std', 'rfas_median', 'rfas_min', 'rfas_max',
+                                'sel_score_mean', 'sel_score_std', 'sel_score_median',
+                                'iou_abs_conf', 'overlap_abs', 'overlap_conf',
+                                'n_nan', 'n_inf',
+                            ]
+                            write_header = not os.path.exists(stats_path)
+                            with open(stats_path, 'a', newline='') as f:
+                                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                                if write_header:
+                                    writer.writeheader()
+                                row = {k: stats.get(k, '') for k in fieldnames}
+                                writer.writerow(row)
+
+                            # TensorBoard logging
+                            if tb_writer is not None:
+                                tb_writer.add_scalar('candidate/abs_count', stats.get('n_abs_candidates', 0), iteration)
+                                tb_writer.add_scalar('candidate/conf_count', stats.get('n_conf_candidates', 0), iteration)
+                                tb_writer.add_scalar('candidate/and_count', stats.get('n_and_candidates', 0), iteration)
+                                tb_writer.add_scalar('candidate/or_count', stats.get('n_or_candidates', 0), iteration)
+                                tb_writer.add_scalar('candidate/final_count', stats.get('n_final_candidates', 0), iteration)
+                                tb_writer.add_scalar('candidate/final_ratio', stats.get('candidate_ratio', 0), iteration)
+                                tb_writer.add_scalar('candidate/score_mean', stats.get('sel_score_mean', 0), iteration)
+                                tb_writer.add_scalar('candidate/score_std', stats.get('sel_score_std', 0), iteration)
+                                tb_writer.add_scalar('candidate/overlap_iou', stats.get('iou_abs_conf', 0), iteration)
 
                     # Stop fusion timer AFTER fused-score consumption (densify_and_prune_Improved)
                     if opt.profile_components:
