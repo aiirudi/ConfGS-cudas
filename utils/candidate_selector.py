@@ -603,7 +603,7 @@ def select_densification_candidates(
     # 构造 finite-valid mask，统一从 final_mask 和 selection_score 中排除 NaN/Inf
     finite_mask = _finite_valid_mask(selection_score, abs_score.squeeze(), conf_score, rfas_score)
     final_mask = final_mask & finite_mask
-    selection_score[~finite_mask] = 0.0
+    selection_score[~finite_mask] = float('-inf')
 
     # 应用固定预算（如果配置了）
     budget_mode = getattr(config, 'candidate_budget_mode', 'native')

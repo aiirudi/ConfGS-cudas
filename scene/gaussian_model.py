@@ -495,8 +495,12 @@ class GaussianModel:
             self.candidate_stats['strategy'] = 'and (fallback)'
             self.candidate_stats['iteration'] = iteration
         else:
-            # rfas_score 回退到 scores（融合分数），若未传入原始 RFAS
-            _rfas = rfas_score if rfas_score is not None else scores
+            # 布尔策略用融合分数 (scores), 连续策略用原始 RFAS
+            # 保证默认 and 策略下 selection_score = 融合 EAS+RFAS
+            if strategy in ('and', 'or', 'abs_only', 'conf_only'):
+                _rfas = scores  # 融合分数 tt_importance
+            else:
+                _rfas = rfas_score if rfas_score is not None else scores
             final_mask, selection_score, _stats = select_densification_candidates(
                 abs_score=grad_vars,
                 conf_score=conf,
