@@ -45,7 +45,7 @@ def project_gaussian_centers(xyz, full_proj_transform, world_view_transform, wid
     # view-space depth: xyz_hom @ world_view_transform, 取 z
     ones = torch.ones(N, 1, dtype=xyz.dtype, device=xyz.device)
     xyz_hom = torch.cat([xyz, ones], dim=1)  # (N, 4)
-    view_pos = torch.matmul(xyz_hom, world_view_transform.unsqueeze(0))  # (N, 4)
+    view_pos = torch.matmul(xyz_hom, world_view_transform)  # (N, 4)
     view_depth = view_pos[:, 2]  # (N,) view-space z
 
     return pixel_coords, view_depth
@@ -189,11 +189,27 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
     camera_uid = getattr(camera, 'uid', '0')
     file_prefix = f"iteration_{iteration:06d}_view{camera_uid}"
 
+    # score 名称映射 (用于 metadata 和 Top-K 标注)
+    score_name_map = {'conf': 'conf_score', 'final_candidates': 'selection_score'}
+
     mask_types_to_process = []
     if mask_type == 'both':
         mask_types_to_process = ['conf', 'final_candidates']
     else:
         mask_types_to_process = [mask_type]
+
+    # 将渲染图转为 PIL 一次 (满足同一次 render 要求, AC-4)
+    to_pil = ToPILImage()
+    if render_image.dim() == 4:
+        img_tensor = render_image.squeeze(0)
+    else:
+        img_tensor = render_image
+    original_pil = to_pil(img_tensor.clamp(0.0, 1.0).cpu())
+
+    # 保存原图一次 (both 模式不重复写入, AC-7)
+    os.makedirs(output_dir, exist_ok=True)
+    render_path = os.path.join(output_dir, f"{file_prefix}_render.png")
+    original_pil.save(render_path)
 
     for current_type in mask_types_to_process:
         if current_type == 'conf':
@@ -214,45 +230,13 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
             selected_indices = torch.nonzero(target_mask, as_tuple=False).squeeze(-1)
             selected_xyz = gaussians.get_xyz.detach()[target_mask].clone()
 
-        # ---- 投影 ----
+        # ---- 投影与过滤 ----
         if selected_count == 0:
-            # 没有选中任何 Gaussian：保存原图，标注图为原图副本
-            to_pil = ToPILImage()
-            if render_image.dim() == 4:
-                img_tensor = render_image.squeeze(0)
-            else:
-                img_tensor = render_image
-            original_pil = to_pil(img_tensor.clamp(0.0, 1.0).cpu())
-
-            os.makedirs(output_dir, exist_ok=True)
-            render_path = os.path.join(output_dir, f"{file_prefix}_render.png")
-            annotated_path = os.path.join(output_dir, f"{file_prefix}_{type_suffix}.png")
-            original_pil.save(render_path)
-            original_pil.save(annotated_path)  # 两张内容一致
-
-            metadata_dict = {
-                'iteration': iteration,
-                'camera_uid': camera_uid,
-                'camera_name': getattr(camera, 'image_name', ''),
-                'mask_type': current_type,
-                'strategy': strategy,
-                'conf_thr': getattr(opt, 'conf_thr', 0.8),
-                'conf_min_views': getattr(opt, 'conf_min_views', 3),
-                'num_gaussians_before': num_gaussians,
-                'mask_count': 0,
-                'visible_count': 0,
-                'drawn_count': 0,
-                'topk_score_name': type_suffix + '_score',
-                'same_render': True,
-                'trigger_reason': getattr(vis_context, 'trigger_reason', ''),
-            }
-            metadata_path = os.path.join(output_dir, "metadata.jsonl")
-            with open(metadata_path, 'a') as f:
-                f.write(json.dumps(metadata_dict) + '\n')
-
-            print(f"[ConfVis] iter={iteration} mask_type={current_type}: "
-                  f"0 selected gaussians, saved empty overlay")
-
+            # 没有选中任何 Gaussian: 标注图为原图副本
+            annotated_pil = original_pil.copy()
+            drawn_count = 0
+            visible_count = 0
+            visible_indices = torch.empty(0, dtype=torch.long)
         else:
             pixel_coords, view_depth = project_gaussian_centers(
                 selected_xyz,
@@ -262,7 +246,6 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
                 camera.image_height,
             )
 
-            # ---- 过滤 ----
             valid_mask = filter_visible_points(
                 pixel_coords, view_depth,
                 camera.image_width, camera.image_height,
@@ -281,61 +264,49 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
                 visible_indices = visible_indices[topk.indices]
                 drawn_count = max_points
 
-            # ---- 保存原图 + 绘制并保存标注图 ----
-            to_pil = ToPILImage()
-            if render_image.dim() == 4:
-                img_tensor = render_image.squeeze(0)
-            else:
-                img_tensor = render_image
-            original_pil = to_pil(img_tensor.clamp(0.0, 1.0).cpu())
-
-            # 只在 conf 类型或 only 类型时保存原图 (both 模式一张原图即可)
-            if current_type == 'conf' or mask_type != 'both':
-                os.makedirs(output_dir, exist_ok=True)
-                render_path = os.path.join(output_dir, f"{file_prefix}_render.png")
-                original_pil.save(render_path)
-
-            # 绘制标注图
+            # ---- 绘制标注图 ----
             if drawn_count > 0:
                 annotated_pil = draw_conf_overlay(original_pil, visible_coords, point_radius)
             else:
                 annotated_pil = original_pil.copy()
 
-            os.makedirs(output_dir, exist_ok=True)
-            annotated_path = os.path.join(output_dir, f"{file_prefix}_{type_suffix}.png")
-            annotated_pil.save(annotated_path)
+        # ---- 保存标注图 ----
+        annotated_path = os.path.join(output_dir, f"{file_prefix}_{type_suffix}.png")
+        annotated_pil.save(annotated_path)
 
-            # ---- metadata ----
-            metadata_dict = {
-                'iteration': iteration,
-                'camera_uid': camera_uid,
-                'camera_name': getattr(camera, 'image_name', ''),
-                'mask_type': current_type,
-                'strategy': strategy,
-                'conf_thr': getattr(opt, 'conf_thr', 0.8),
-                'conf_min_views': getattr(opt, 'conf_min_views', 3),
-                'num_gaussians_before': num_gaussians,
-                'mask_count': selected_count,
-                'visible_count': visible_count,
-                'drawn_count': drawn_count,
-                'topk_score_name': current_type + '_score',
-                'same_render': True,
-                'trigger_reason': getattr(vis_context, 'trigger_reason', ''),
-            }
-            metadata_path = os.path.join(output_dir, "metadata.jsonl")
-            with open(metadata_path, 'a') as f:
-                f.write(json.dumps(metadata_dict) + '\n')
+        # ---- metadata (jsonl append) ----
+        metadata_dict = {
+            'iteration': iteration,
+            'camera_uid': camera_uid,
+            'camera_name': getattr(camera, 'image_name', ''),
+            'mask_type': current_type,
+            'strategy': strategy,
+            'conf_thr': getattr(opt, 'conf_thr', 0.8),
+            'conf_min_views': getattr(opt, 'conf_min_views', 3),
+            'num_gaussians_before': num_gaussians,
+            'mask_count': selected_count,
+            'visible_count': visible_count,
+            'drawn_count': drawn_count,
+            'topk_score_name': score_name_map.get(current_type, current_type + '_score'),
+            'same_render': True,
+            'trigger_reason': vis_context.get('trigger_reason', ''),
+        }
+        metadata_path = os.path.join(output_dir, "metadata.jsonl")
+        with open(metadata_path, 'a') as f:
+            f.write(json.dumps(metadata_dict) + '\n')
 
-            # ---- 保存索引 (用于后续对齐验证) ----
-            indices_data = {
-                'iteration': iteration,
-                'selected_indices': selected_indices.cpu().tolist(),
-                'drawn_indices': visible_indices.cpu().tolist() if drawn_count > 0 else [],
-            }
-            indices_path = os.path.join(output_dir, f"{file_prefix}_{type_suffix}_indices.pt")
-            torch.save(indices_data, indices_path)
+        # ---- 保存索引 (用于后续对齐验证, AC-11) ----
+        indices_data = {
+            'iteration': iteration,
+            'camera_uid': camera_uid,
+            'mask_type': current_type,
+            'selected_indices': selected_indices.cpu().tolist(),
+            'drawn_indices': visible_indices.cpu().tolist(),
+        }
+        indices_path = os.path.join(output_dir, f"{file_prefix}_{type_suffix}_indices.pt")
+        torch.save(indices_data, indices_path)
 
-            print(f"[ConfVis] iter={iteration} mask_type={current_type}: "
-                  f"N={num_gaussians}, selected={selected_count}, "
-                  f"visible={visible_count}, drawn={drawn_count}, "
-                  f"strategy={strategy}")
+        print(f"[ConfVis] iter={iteration} mask_type={current_type}: "
+              f"N={num_gaussians}, selected={selected_count}, "
+              f"visible={visible_count}, drawn={drawn_count}, "
+              f"strategy={strategy}")
