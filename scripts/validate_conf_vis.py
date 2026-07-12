@@ -112,6 +112,18 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
 
             metadata_rows.append(entry)
 
+    # ---- enabled 模式守卫: 期望开启时必须有输出 ----
+    if expect_mask_types:
+        if not metadata_rows:
+            print("FAIL: metadata.jsonl 为空, 但期望开启可视化 (AC-11)")
+            all_ok = False
+        if not render_files:
+            print("FAIL: 无 render 文件, 但期望开启可视化 (AC-7)")
+            all_ok = False
+        if not overlay_files:
+            print("FAIL: 无 overlay 文件, 但期望开启可视化 (AC-7)")
+            all_ok = False
+
     # ---- 按 trigger prefix 分组验证 (AC-7) ----
     # 每个 prefix 必须有一张 render + 所有期望的 mask_type overlay/indices
     prefix_map = {}  # prefix -> set of mask_types
