@@ -197,23 +197,28 @@ def check_projection(model_path, source_path, iteration):
     使用 render.py 的 Scene 加载模式, 从 cfg_args 读取完整数据集参数。
     """
     import torch
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from gaussian_renderer import render, GaussianModel
     from scene import Scene
-    from arguments import ModelParams, PipelineParams, get_combined_args
-    from argparse import ArgumentParser
+    from arguments import PipelineParams
+    from argparse import ArgumentParser, Namespace
     from utils.conf_visualization import project_gaussian_centers, filter_visible_points
 
-    # 构造与 render.py 一致的参数
-    sys.argv = [
-        'validate_conf_vis.py',
-        '-s', source_path,
-        '-m', model_path,
-        '--iteration', str(iteration),
-    ]
-    parser = ArgumentParser(description="Conf vis projection validation")
-    mp = ModelParams(parser)
-    pp = PipelineParams(parser)
-    args = get_combined_args(parser)
+    # 从 cfg_args 读取数据集参数, 构造与 render.py 一致的 args
+    import types
+    cfg_path = os.path.join(model_path, "cfg_args")
+    if not os.path.exists(cfg_path):
+        print(f"FAIL: cfg_args 不存在: {cfg_path}")
+        return False
+    with open(cfg_path) as f:
+        cfg_str = f.read()
+    args = eval(cfg_str, {'Namespace': Namespace})
+    args.iteration = iteration
+    args.source_path = source_path or args.source_path
+
+    pp_parser = ArgumentParser()
+    pp = PipelineParams(pp_parser).extract(pp_parser.parse_args([]))
 
     with torch.no_grad():
         gaussians = GaussianModel(args.sh_degree, optimizer_type="default")
