@@ -1,13 +1,17 @@
 """Conf 候选点可视化端到端验证脚本。
 
-用途: 在 Docker rfgs 容器中运行, 验证可视化功能是否满足验收标准。
+在 Docker rfgs 容器中运行, 验证可视化功能是否满足验收标准。
 
 用法:
-    # 检查已生成的可视化文件是否完整
-    python scripts/validate_conf_vis.py --check-artifacts <model_path>
+    # 基线验证: 关闭可视化, 确认零开销
+    python scripts/validate_conf_vis.py --check-artifacts <model_path> --expect-disabled
 
-    # 投影对齐验证 (需要 rasterizer 环境)
-    python scripts/validate_conf_vis.py --check-projection <model_path> --iteration 7000
+    # 开启可视化验证: 检查文件完整性
+    python scripts/validate_conf_vis.py --check-artifacts <model_path> --expect-mask-types conf
+    python scripts/validate_conf_vis.py --check-artifacts <model_path> --expect-mask-types conf final_candidates
+
+    # 投影对齐验证
+    python scripts/validate_conf_vis.py --check-projection <model_path> -s <source_path> --iteration 7000
 """
 
 import argparse
@@ -16,235 +20,345 @@ import os
 import sys
 
 
-def check_artifacts(model_path):
-    """验证可视化输出文件的完整性 (AC-7, AC-11, AC-12)."""
+# AC-11 要求的完整 metadata 字段列表
+REQUIRED_METADATA_FIELDS = [
+    'iteration', 'camera_uid', 'camera_name', 'mask_type',
+    'strategy', 'conf_thr', 'conf_min_views',
+    'num_gaussians_before', 'mask_count', 'visible_count', 'drawn_count',
+    'topk_score_name', 'same_render', 'trigger_reason',
+]
+
+# mask_type → 期望的 topk_score_name 映射
+SCORE_NAME_MAP = {
+    'conf': 'conf_score',
+    'final_candidates': 'selection_score',
+}
+
+
+def check_artifacts(model_path, expect_disabled, expect_mask_types):
+    """验证可视化输出文件的完整性。
+
+    Args:
+        model_path: 模型输出目录
+        expect_disabled: True = 期望可视化已关闭 (AC-1 验证)
+        expect_mask_types: 期望的 mask 类型列表, 如 ['conf'] 或 ['conf', 'final_candidates']
+    """
     vis_dir = os.path.join(model_path, "conf_interval_visualization")
-    if not os.path.isdir(vis_dir):
-        print(f"PASS: {vis_dir} 不存在 (默认关闭时零开销, AC-1)")
+
+    if expect_disabled:
+        if os.path.isdir(vis_dir):
+            print(f"FAIL: {vis_dir} 存在, 但期望关闭可视化 (AC-1)")
+            return False
+        print(f"PASS: {vis_dir} 不存在 (默认关闭时零开销)")
         return True
 
+    # 期望开启可视化
+    if not os.path.isdir(vis_dir):
+        print(f"FAIL: {vis_dir} 不存在, 但期望开启可视化")
+        return False
+
+    all_ok = True
+
+    # 收集文件
     files = sorted(os.listdir(vis_dir))
-    render_files = [f for f in files if f.endswith('_render.png')]
-    conf_files = [f for f in files if f.endswith('_conf.png')]
-    final_files = [f for f in files if f.endswith('_final_candidates.png')]
-    indices_files = [f for f in files if f.endswith('_indices.pt')]
+    render_files = {f for f in files if f.endswith('_render.png')}
+    overlay_files = {f for f in files if f.endswith('_conf.png') or f.endswith('_final_candidates.png')}
+    indices_files = {f for f in files if f.endswith('_indices.pt')}
     metadata_path = os.path.join(vis_dir, "metadata.jsonl")
 
     print(f"可视化目录: {vis_dir}")
     print(f"  文件总数: {len(files)}")
-    print(f"  render png: {len(render_files)}")
-    print(f"  conf overlay: {len(conf_files)}")
-    print(f"  final_candidates overlay: {len(final_files)}")
-    print(f"  indices pt: {len(indices_files)}")
-    print(f"  metadata.jsonl: {'存在' if os.path.exists(metadata_path) else '缺失'}")
+    print(f"  render: {sorted(render_files)}")
+    print(f"  overlay: {sorted(overlay_files)}")
+    print(f"  indices: {sorted(indices_files)}")
 
-    all_ok = True
-
-    # AC-7: both 模式不应有重复 render
-    # 检查每个 iteration+camera 组合是否只有一张 render
-    render_prefixes = set()
-    for rf in render_files:
-        prefix = rf.rsplit('_render.png', 1)[0]
-        if prefix in render_prefixes:
-            print(f"FAIL: 重复 render 文件 {rf} (AC-7)")
-            all_ok = False
-        render_prefixes.add(prefix)
-
-    # AC-12: 每个 mask 类型应有对应文件
-    mask_types_found = set()
-    for cf in conf_files:
-        mask_types_found.add('conf')
-        # 验证文件命名格式: iteration_XXXXXX_viewYY_conf.png
-        parts = cf.split('_')
-        if len(parts) >= 4:
-            print(f"  conf overlay: {cf}")
-    for ff in final_files:
-        mask_types_found.add('final_candidates')
-        print(f"  final_candidates overlay: {ff}")
-
-    # AC-11: metadata 完整性
-    if os.path.exists(metadata_path):
+    # ---- metadata.jsonl (AC-11) ----
+    if not os.path.exists(metadata_path):
+        print("FAIL: metadata.jsonl 缺失 (AC-11)")
+        all_ok = False
+    else:
         with open(metadata_path, 'r') as f:
             lines = f.readlines()
-        print(f"  metadata 条目数: {len(lines)}")
+        print(f"  metadata 条目: {len(lines)}")
+
+        metadata_rows = []
         for i, line in enumerate(lines):
             try:
                 entry = json.loads(line)
-                required_fields = ['iteration', 'camera_uid', 'mask_type',
-                                   'strategy', 'mask_count', 'drawn_count',
-                                   'topk_score_name', 'trigger_reason']
-                missing = [k for k in required_fields if k not in entry]
-                if missing:
-                    print(f"FAIL: metadata 行 {i} 缺少字段: {missing} (AC-11)")
-                    all_ok = False
-                # 验证 score_name
-                mt = entry.get('mask_type', '')
-                expected_score = 'conf_score' if mt == 'conf' else 'selection_score'
-                actual_score = entry.get('topk_score_name', '')
-                if mt and actual_score != expected_score:
-                    print(f"FAIL: metadata 行 {i} topk_score_name={actual_score}, 期望={expected_score} (AC-11)")
-                    all_ok = False
-                # 验证 trigger_reason 非空
-                if not entry.get('trigger_reason', ''):
-                    print(f"WARN: metadata 行 {i} trigger_reason 为空")
             except json.JSONDecodeError:
-                print(f"FAIL: metadata 行 {i} 不是有效 JSON")
+                print(f"FAIL: metadata 行 {i} 不是有效 JSON (AC-11)")
+                all_ok = False
+                continue
+
+            # 检查所有 required 字段
+            missing = [k for k in REQUIRED_METADATA_FIELDS if k not in entry]
+            if missing:
+                print(f"FAIL: metadata 行 {i} 缺少字段: {missing} (AC-11)")
                 all_ok = False
 
-    # AC-12: 验证 indices pt 文件
+            # 验证 score_name 正确映射
+            mt = entry.get('mask_type', '')
+            expected = SCORE_NAME_MAP.get(mt, '')
+            actual = entry.get('topk_score_name', '')
+            if expected and actual != expected:
+                print(f"FAIL: metadata 行 {i} topk_score_name={actual}, 期望={expected} (AC-11)")
+                all_ok = False
+
+            # trigger_reason 验证
+            if not entry.get('trigger_reason', ''):
+                print(f"WARN: metadata 行 {i} trigger_reason 为空")
+
+            metadata_rows.append(entry)
+
+        # 验证 trigger 与文件的一一对应
+        seen_prefixes = set()
+        for entry in metadata_rows:
+            it = entry.get('iteration', 0)
+            uid = entry.get('camera_uid', '')
+            mt = entry.get('mask_type', '')
+            prefix = f"iteration_{it:06d}_view{uid}"
+
+            # render 文件应存在
+            render_name = f"{prefix}_render.png"
+            if render_name not in render_files:
+                print(f"FAIL: metadata 引用 {render_name} 但文件不存在")
+                all_ok = False
+
+            # overlay 文件应存在
+            overlay_name = f"{prefix}_{mt}.png"
+            if overlay_name not in overlay_files:
+                print(f"FAIL: metadata 引用 {overlay_name} 但文件不存在")
+                all_ok = False
+
+            # indices 文件应存在
+            idx_name = f"{prefix}_{mt}_indices.pt"
+            if idx_name not in indices_files:
+                print(f"FAIL: metadata 引用 {idx_name} 但文件不存在")
+                all_ok = False
+
+            seen_prefixes.add((it, uid))
+
+    # ---- indices.pt 验证 (AC-11) ----
+    import torch
     for idx_file in indices_files:
-        import torch
         data = torch.load(os.path.join(vis_dir, idx_file), map_location='cpu')
-        required_idx_fields = ['iteration', 'camera_uid', 'mask_type',
-                               'selected_indices', 'drawn_indices']
-        missing = [k for k in required_idx_fields if k not in data]
+        required_idx = ['iteration', 'camera_uid', 'mask_type',
+                        'selected_indices', 'drawn_indices']
+        missing = [k for k in required_idx if k not in data]
         if missing:
             print(f"FAIL: {idx_file} 缺少字段: {missing} (AC-11)")
             all_ok = False
 
+    # ---- AC-7: no duplicate renders ----
+    if len(render_files) != len(seen_prefixes):
+        print(f"FAIL: render 文件数 ({len(render_files)}) != trigger 数 ({len(seen_prefixes)}) (AC-7)")
+        all_ok = False
+
+    # ---- 检查期望的 mask_types (AC-7) ----
+    found_types = set()
+    for f in overlay_files:
+        if '_conf.png' in f and not f.endswith('_final_candidates.png'):
+            found_types.add('conf')
+        if '_final_candidates.png' in f:
+            found_types.add('final_candidates')
+    missing_types = set(expect_mask_types) - found_types
+    if missing_types:
+        print(f"FAIL: 缺少期望的 mask 类型文件: {missing_types} (AC-7)")
+        all_ok = False
+
     if all_ok:
-        print("\n所有 artifact 检查通过")
+        print("\nPASS: 所有 artifact 检查通过")
     else:
-        print("\n存在 FAIL 项, 请检查")
+        print("\nFAIL: 存在未满足的验收标准")
     return all_ok
 
 
-def check_projection(model_path, iteration):
-    """投影对齐验证: Python vs CUDA rasterizer gaussian_centers (AC-5)."""
+def check_projection(model_path, source_path, iteration):
+    """投影对齐验证: Python vs CUDA rasterizer gaussian_centers (AC-5).
+
+    使用 render.py 的 Scene 加载模式, 从 cfg_args 读取完整数据集参数。
+    """
     import torch
+    from gaussian_renderer import render, GaussianModel
     from scene import Scene
-    from gaussian_renderer import render
-    from arguments import ModelParams, PipelineParams
+    from arguments import ModelParams, PipelineParams, get_combined_args
     from argparse import ArgumentParser
     from utils.conf_visualization import project_gaussian_centers, filter_visible_points
-    from utils.graphics_utils import ndc_to_pixel
 
-    # 加载 checkpoint
+    # 构造与 render.py 一致的参数
+    sys.argv = [
+        'validate_conf_vis.py',
+        '-s', source_path,
+        '-m', model_path,
+        '--iteration', str(iteration),
+    ]
     parser = ArgumentParser(description="Conf vis projection validation")
-    mp = ModelParams(parser, sentinel=True)
+    mp = ModelParams(parser)
     pp = PipelineParams(parser)
-    mp.model_path = model_path
-    pp.separate_sh = True
+    args = get_combined_args(parser)
 
-    loaded_iter = None
-    ply_dir = os.path.join(model_path, "point_cloud")
-    for d in sorted(os.listdir(ply_dir)):
-        if d.startswith("iteration_"):
-            it = int(d.split("_")[1])
-            if iteration is None or it <= iteration:
-                loaded_iter = it
-    if loaded_iter is None:
-        print(f"FAIL: 未找到 checkpoint iteration <= {iteration}")
-        return False
+    with torch.no_grad():
+        gaussians = GaussianModel(args.sh_degree, optimizer_type="default")
+        scene = Scene(args, gaussians, load_iteration=args.iteration, shuffle=False)
+        bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    print(f"加载 checkpoint: iteration_{loaded_iter}")
+        # 读取可视化 metadata 获取使用的相机
+        vis_dir = os.path.join(model_path, "conf_interval_visualization")
+        metadata_path = os.path.join(vis_dir, "metadata.jsonl")
+        if not os.path.exists(metadata_path):
+            print("FAIL: metadata.jsonl 不存在, 无法确定可视化相机")
+            return False
 
-    gaussians = None  # Will be loaded by Scene
-    scene = Scene(
-        dataset=mp, gaussians=gaussians,
-        load_iteration=loaded_iter, shuffle=False
-    )
-    gaussians = scene.gaussians
-    cameras = scene.getTrainCameras()
+        with open(metadata_path, 'r') as f:
+            all_meta = [json.loads(l) for l in f.readlines()]
 
-    bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+        # 找匹配 iteration 的第一条 metadata
+        target_meta = None
+        for m in all_meta:
+            if m.get('iteration') == args.iteration:
+                target_meta = m
+                break
+        if target_meta is None:
+            print(f"FAIL: metadata 中未找到 iteration={args.iteration}")
+            return False
 
-    # 选取一个相机进行投影验证
-    test_cam = cameras[0]
-    print(f"测试相机: uid={test_cam.uid}, {test_cam.image_width}x{test_cam.image_height}")
+        camera_uid = target_meta['camera_uid']
+        mask_type = target_meta['mask_type']
 
-    # 渲染获取 rasterizer gaussian_centers
-    render_pkg = render(test_cam, gaussians, pp, bg)
-    raster_centers = render_pkg.get("gaussian_centers", None)
-    if raster_centers is None:
-        print("FAIL: rasterizer 未返回 gaussian_centers (AC-9 检查)")
-        return False
+        # 找到匹配的相机
+        test_cam = None
+        for cam in scene.getTrainCameras():
+            if str(cam.uid) == str(camera_uid):
+                test_cam = cam
+                break
+        if test_cam is None:
+            print(f"FAIL: 未找到 uid={camera_uid} 的相机")
+            return False
 
-    # 过滤有效 raster centers (非零, 可见)
-    valid_raster = (raster_centers[:, 0] > 0) & (raster_centers[:, 1] > 0)
-    valid_raster &= (raster_centers[:, 0] < test_cam.image_width)
-    valid_raster &= (raster_centers[:, 1] < test_cam.image_height)
-    raster_valid = raster_centers[valid_raster]
+        print(f"测试相机: uid={test_cam.uid}, name={test_cam.image_name}, "
+              f"{test_cam.image_width}x{test_cam.image_height}")
 
-    if raster_valid.shape[0] < 10:
-        print(f"WARN: 仅有 {raster_valid.shape[0]} 个有效 raster centers, 样本不足")
-        return True  # 不是失败, 只是样本不足
+        # 渲染获取 rasterizer gaussian_centers
+        render_pkg = render(test_cam, gaussians, pp, bg)
+        raster_centers = render_pkg.get("gaussian_centers", None)
+        if raster_centers is None:
+            print("FAIL: rasterizer 未返回 gaussian_centers")
+            return False
 
-    # Python 投影
-    xyz = gaussians.get_xyz.detach()
-    python_pix, view_depth = project_gaussian_centers(
-        xyz,
-        test_cam.full_proj_transform,
-        test_cam.world_view_transform,
-        test_cam.image_width,
-        test_cam.image_height,
-    )
+        # 读取对应的 drawn_indices
+        idx_file = os.path.join(
+            vis_dir,
+            f"iteration_{args.iteration:06d}_view{camera_uid}_{mask_type}_indices.pt"
+        )
+        if not os.path.exists(idx_file):
+            print(f"FAIL: indices 文件不存在: {idx_file}")
+            return False
 
-    # 过滤可见点
-    valid_python = filter_visible_points(
-        python_pix, view_depth,
-        test_cam.image_width, test_cam.image_height,
-    )
+        indices_data = torch.load(idx_file, map_location='cpu')
+        drawn_indices = indices_data.get('drawn_indices', [])
+        if len(drawn_indices) == 0:
+            print("WARN: drawn_indices 为空, 无可对比的投影点")
+            return True
 
-    # 取交集索引
-    intersect_indices = valid_raster.nonzero(as_tuple=False).squeeze(-1)
-    intersect_indices_py = torch.where(valid_python)[0]
+        drawn_indices = torch.tensor(drawn_indices, dtype=torch.long, device="cuda")
 
-    # 对交集点计算像素误差
-    # 由于索引不同, 需要做一次简单的最近邻匹配或直接取交集
-    # 简化: 取 raster 有效的点, 对比 python 投影
-    if intersect_indices.shape[0] == 0:
-        print("WARN: raster 和 python 可见集无交集")
-        return True
+        # Python 投影
+        xyz = gaussians.get_xyz.detach()
+        python_pix, view_depth = project_gaussian_centers(
+            xyz, test_cam.full_proj_transform,
+            test_cam.world_view_transform,
+            test_cam.image_width, test_cam.image_height,
+        )
 
-    # 使用 raster 有效的索引取 python 投影
-    py_for_raster = python_pix[intersect_indices]
-    errors = torch.norm(py_for_raster - raster_valid, dim=-1)
+        # 取 drawn_indices 对应的 Python 投影和 rasterizer centers
+        py_for_drawn = python_pix[drawn_indices]  # (K, 2)
+        raster_for_drawn = raster_centers[drawn_indices]  # (K, 2)
 
-    median_err = torch.median(errors).item()
-    p95_err = torch.quantile(errors, 0.95).item()
-    max_err = torch.max(errors).item()
+        # 过滤有效 raster centers
+        valid_r = (raster_for_drawn[:, 0] > 0) & (raster_for_drawn[:, 1] > 0)
+        valid_r &= (raster_for_drawn[:, 0] < test_cam.image_width)
+        valid_r &= (raster_for_drawn[:, 1] < test_cam.image_height)
+        valid_r &= torch.isfinite(py_for_drawn).all(dim=-1)
 
-    print(f"\n投影对齐结果 (N={intersect_indices.shape[0]} 个匹配点):")
-    print(f"  median: {median_err:.3f} px")
-    print(f"  p95:    {p95_err:.3f} px")
-    print(f"  max:    {max_err:.3f} px")
+        if valid_r.sum() < 10:
+            print(f"WARN: 仅有 {valid_r.sum().item()} 个有效匹配点, 样本不足")
+            return True
 
-    # AC-5 阈值
-    if median_err <= 0.5 and p95_err <= 1.0:
-        print("PASS: 投影对齐满足精度要求 (AC-5)")
-        return True
-    elif median_err <= 1.0:
-        print("WARN: median 通过但 p95 略超阈值")
-        return True
-    else:
-        print("FAIL: 投影误差过大, 可能 y 轴翻转或矩阵约定不匹配")
-        return False
+        py_valid = py_for_drawn[valid_r]
+        raster_valid = raster_for_drawn[valid_r]
+        errors = torch.norm(py_valid - raster_valid, dim=-1)
+
+        median_err = torch.median(errors).item()
+        p95_err = torch.quantile(errors, 0.95).item()
+        max_err = torch.max(errors).item()
+
+        print(f"\n投影对齐结果 (N={valid_r.sum().item()} 个匹配点):")
+        print(f"  median: {median_err:.3f} px")
+        print(f"  p95:    {p95_err:.3f} px")
+        print(f"  max:    {max_err:.3f} px")
+
+        # AC-5 严格阈值: 两者都必须通过
+        if median_err <= 0.5 and p95_err <= 1.0:
+            print("PASS: 投影对齐满足精度要求 (AC-5)")
+            return True
+        else:
+            print(f"FAIL: 投影误差超阈值 (AC-5: median≤0.5px, p95≤1.0px)")
+            return False
 
 
 def main():
     parser = argparse.ArgumentParser(description="Conf 可视化验证脚本")
     parser.add_argument("--check-artifacts", type=str, default=None,
                         help="检查指定 model_path 的可视化输出文件")
+    parser.add_argument("--expect-disabled", action="store_true",
+                        help="期望可视化已关闭 (基线验证, AC-1)")
+    parser.add_argument("--expect-mask-types", type=str, nargs='*', default=[],
+                        help="期望的 mask 类型: conf final_candidates")
     parser.add_argument("--check-projection", type=str, default=None,
-                        help="投影对齐验证 (需要 model_path)")
+                        help="投影对齐验证 (需要 model_path, 需传 -s source_path)")
+    parser.add_argument("-s", "--source_path", type=str, default=None,
+                        help="数据源路径 (用于投影验证)")
     parser.add_argument("--iteration", type=int, default=None,
                         help="指定 iteration (用于投影验证)")
     args = parser.parse_args()
 
+    ok = True
+
     if args.check_artifacts:
-        ok = check_artifacts(args.check_artifacts)
-        if not ok:
-            sys.exit(1)
+        ok = check_artifacts(args.check_artifacts, args.expect_disabled,
+                             args.expect_mask_types)
 
     if args.check_projection:
-        ok = check_projection(args.check_projection, args.iteration)
-        if not ok:
+        if not args.iteration:
+            print("ERROR: --check-projection 需要 --iteration")
             sys.exit(1)
+        src = args.source_path
+        if not src:
+            # 尝试从 cfg_args 读取
+            cfg_path = os.path.join(args.check_projection, "cfg_args")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    cfg_str = f.read()
+                import re
+                m = re.search(r"source_path='([^']+)'", cfg_str)
+                if m:
+                    src = m.group(1)
+            if not src:
+                print("ERROR: --check-projection 需要 -s <source_path> 或有效的 cfg_args")
+                sys.exit(1)
+        ok = check_projection(args.check_projection, src, args.iteration)
 
     if not args.check_artifacts and not args.check_projection:
-        print("用法: python scripts/validate_conf_vis.py --check-artifacts <model_path>")
-        print("      python scripts/validate_conf_vis.py --check-projection <model_path> --iteration 7000")
+        print("用法示例:")
+        print("  # 基线验证")
+        print("  python scripts/validate_conf_vis.py --check-artifacts <model_path> --expect-disabled")
+        print("  # 开启可视化验证")
+        print("  python scripts/validate_conf_vis.py --check-artifacts <model_path> --expect-mask-types conf")
+        print("  # 投影对齐")
+        print("  python scripts/validate_conf_vis.py --check-projection <model_path> -s <source_path> --iteration 7000")
+
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

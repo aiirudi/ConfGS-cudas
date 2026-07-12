@@ -36,6 +36,8 @@ class ParamGroup:
             else:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
+                elif t in (list, tuple):
+                    group.add_argument("--" + key, default=value, nargs='*', type=int)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -162,7 +164,7 @@ class OptimizationParams(ParamGroup):
 
         # Conf 候选点可视化参数
         self.visualize_conf = False
-        self.conf_vis_iterations = ""
+        self.conf_vis_iterations = []
         self.conf_vis_all_intervals = False
         self.conf_vis_point_radius = 3
         self.conf_vis_max_points = 5000
