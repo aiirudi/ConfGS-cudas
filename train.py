@@ -301,7 +301,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
                         if should_vis:
                             vis_context = {
-                                'model_path': args.model_path,
+                                'model_path': dataset.model_path,
                                 'camera': viewpoint_cam,
                                 'render_image': image.detach(),
                                 'iteration': iteration,
@@ -319,7 +319,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         stats = gaussians.candidate_stats
                         if stats and 'strategy' in stats:
                             import csv
-                            stats_path = os.path.join(args.model_path, "candidate_selection_stats.csv")
+                            stats_path = os.path.join(dataset.model_path, "candidate_selection_stats.csv")
                             fieldnames = [
                                 'iteration', 'strategy',
                                 'num_gaussians_before', 'num_gaussians_after',

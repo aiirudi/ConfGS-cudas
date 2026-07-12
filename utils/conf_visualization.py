@@ -210,7 +210,7 @@ def save_conf_visualization(gaussians, conf_mask, conf_score,
 
     mask_types_to_process = []
     if mask_type == 'both':
-        mask_types_to_process = ['conf', 'final_candidates', 'abs']
+        mask_types_to_process = ['conf', 'final_candidates']
     elif mask_type == 'all':
         mask_types_to_process = ['conf', 'final_candidates', 'abs']
     else:
