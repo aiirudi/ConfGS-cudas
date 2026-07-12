@@ -279,13 +279,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                             should_vis = True
                             trigger_reason = "all_intervals"
                         elif getattr(opt, 'conf_vis_iterations', None):
-                            # 兼容 list (argparse nargs) 和 str (旧 cfg_args) 两种格式
+                            # 统一解析所有格式: str (旧cfg_args), 单token字符串, unquoted多token列表
                             vis_iters_raw = opt.conf_vis_iterations
-                            if isinstance(vis_iters_raw, str):
-                                vis_iters = [int(x) for x in vis_iters_raw.split()]
-                            else:
-                                vis_iters = list(vis_iters_raw)
-                            if iteration in vis_iters:
+                            vis_iters = []
+                            tokens = [vis_iters_raw] if isinstance(vis_iters_raw, str) else vis_iters_raw
+                            for token in (tokens or []):
+                                for part in str(token).split():
+                                    try:
+                                        vis_iters.append(int(part))
+                                    except ValueError:
+                                        pass
+                            if vis_iters and iteration in vis_iters:
                                 should_vis = True
                                 trigger_reason = "explicit_iteration"
                         else:

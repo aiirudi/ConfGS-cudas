@@ -73,6 +73,8 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
     print(f"  indices: {sorted(indices_files)}")
 
     # ---- metadata.jsonl (AC-11) ----
+    metadata_rows = []
+    seen_prefixes = set()
     if not os.path.exists(metadata_path):
         print("FAIL: metadata.jsonl 缺失 (AC-11)")
         all_ok = False
@@ -81,7 +83,6 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
             lines = f.readlines()
         print(f"  metadata 条目: {len(lines)}")
 
-        metadata_rows = []
         for i, line in enumerate(lines):
             try:
                 entry = json.loads(line)
@@ -90,13 +91,11 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
                 all_ok = False
                 continue
 
-            # 检查所有 required 字段
             missing = [k for k in REQUIRED_METADATA_FIELDS if k not in entry]
             if missing:
                 print(f"FAIL: metadata 行 {i} 缺少字段: {missing} (AC-11)")
                 all_ok = False
 
-            # 验证 score_name 正确映射
             mt = entry.get('mask_type', '')
             expected = SCORE_NAME_MAP.get(mt, '')
             actual = entry.get('topk_score_name', '')
@@ -104,39 +103,59 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
                 print(f"FAIL: metadata 行 {i} topk_score_name={actual}, 期望={expected} (AC-11)")
                 all_ok = False
 
-            # trigger_reason 验证
             if not entry.get('trigger_reason', ''):
                 print(f"WARN: metadata 行 {i} trigger_reason 为空")
 
             metadata_rows.append(entry)
 
-        # 验证 trigger 与文件的一一对应
-        seen_prefixes = set()
-        for entry in metadata_rows:
-            it = entry.get('iteration', 0)
-            uid = entry.get('camera_uid', '')
-            mt = entry.get('mask_type', '')
-            prefix = f"iteration_{it:06d}_view{uid}"
+    # ---- 按 trigger prefix 分组验证 (AC-7) ----
+    # 每个 prefix 必须有一张 render + 所有期望的 mask_type overlay/indices
+    prefix_map = {}  # prefix -> set of mask_types
+    for entry in metadata_rows:
+        it = entry.get('iteration', 0)
+        uid = entry.get('camera_uid', '')
+        mt = entry.get('mask_type', '')
+        prefix = f"iteration_{it:06d}_view{uid}"
+        seen_prefixes.add(prefix)
+        prefix_map.setdefault(prefix, set()).add(mt)
 
-            # render 文件应存在
-            render_name = f"{prefix}_render.png"
-            if render_name not in render_files:
-                print(f"FAIL: metadata 引用 {render_name} 但文件不存在")
-                all_ok = False
+        render_name = f"{prefix}_render.png"
+        if render_name not in render_files:
+            print(f"FAIL: metadata 引用 {render_name} 但文件不存在")
+            all_ok = False
 
-            # overlay 文件应存在
-            overlay_name = f"{prefix}_{mt}.png"
-            if overlay_name not in overlay_files:
-                print(f"FAIL: metadata 引用 {overlay_name} 但文件不存在")
-                all_ok = False
+        overlay_name = f"{prefix}_{mt}.png"
+        if overlay_name not in overlay_files:
+            print(f"FAIL: metadata 引用 {overlay_name} 但文件不存在")
+            all_ok = False
 
-            # indices 文件应存在
-            idx_name = f"{prefix}_{mt}_indices.pt"
-            if idx_name not in indices_files:
-                print(f"FAIL: metadata 引用 {idx_name} 但文件不存在")
-                all_ok = False
+        idx_name = f"{prefix}_{mt}_indices.pt"
+        if idx_name not in indices_files:
+            print(f"FAIL: metadata 引用 {idx_name} 但文件不存在")
+            all_ok = False
 
-            seen_prefixes.add((it, uid))
+    # 检查每个 prefix 是否有所有期望的 mask_type
+    for prefix, found in sorted(prefix_map.items()):
+        missing_types = set(expect_mask_types) - found
+        if missing_types:
+            print(f"FAIL: {prefix} 缺少期望的 mask 类型: {missing_types} (AC-7)")
+            all_ok = False
+
+    # 检查是否有 metadata 未覆盖的孤儿 overlay 文件
+    for f in overlay_files:
+        matched = False
+        for prefix in prefix_map:
+            if f.startswith(prefix):
+                matched = True
+                break
+        if not matched:
+            print(f"WARN: 孤儿 overlay 文件 (无对应 metadata): {f}")
+
+    # ---- AC-7: each prefix exactly one render ----
+    render_count = sum(1 for rf in render_files if any(rf.startswith(p + '_render') for p in prefix_map))
+    if render_count != len(prefix_map):
+        print(f"FAIL: render 文件数 ({render_count}) != trigger 数 ({len(prefix_map)}) (AC-7)")
+        all_ok = False
 
     # ---- indices.pt 验证 (AC-11) ----
     import torch
@@ -148,23 +167,6 @@ def check_artifacts(model_path, expect_disabled, expect_mask_types):
         if missing:
             print(f"FAIL: {idx_file} 缺少字段: {missing} (AC-11)")
             all_ok = False
-
-    # ---- AC-7: no duplicate renders ----
-    if len(render_files) != len(seen_prefixes):
-        print(f"FAIL: render 文件数 ({len(render_files)}) != trigger 数 ({len(seen_prefixes)}) (AC-7)")
-        all_ok = False
-
-    # ---- 检查期望的 mask_types (AC-7) ----
-    found_types = set()
-    for f in overlay_files:
-        if '_conf.png' in f and not f.endswith('_final_candidates.png'):
-            found_types.add('conf')
-        if '_final_candidates.png' in f:
-            found_types.add('final_candidates')
-    missing_types = set(expect_mask_types) - found_types
-    if missing_types:
-        print(f"FAIL: 缺少期望的 mask 类型文件: {missing_types} (AC-7)")
-        all_ok = False
 
     if all_ok:
         print("\nPASS: 所有 artifact 检查通过")
@@ -257,8 +259,8 @@ def check_projection(model_path, source_path, iteration):
         indices_data = torch.load(idx_file, map_location='cpu')
         drawn_indices = indices_data.get('drawn_indices', [])
         if len(drawn_indices) == 0:
-            print("WARN: drawn_indices 为空, 无可对比的投影点")
-            return True
+            print(f"FAIL: drawn_indices 为空, 无可对比的投影点 (task-8)")
+            return False
 
         drawn_indices = torch.tensor(drawn_indices, dtype=torch.long, device="cuda")
 
@@ -281,8 +283,8 @@ def check_projection(model_path, source_path, iteration):
         valid_r &= torch.isfinite(py_for_drawn).all(dim=-1)
 
         if valid_r.sum() < 10:
-            print(f"WARN: 仅有 {valid_r.sum().item()} 个有效匹配点, 样本不足")
-            return True
+            print(f"FAIL: 仅有 {valid_r.sum().item()} 个有效匹配点 (需要 ≥10, task-8)")
+            return False
 
         py_valid = py_for_drawn[valid_r]
         raster_valid = raster_for_drawn[valid_r]

@@ -37,7 +37,7 @@ class ParamGroup:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
                 elif t in (list, tuple):
-                    group.add_argument("--" + key, default=value, nargs='*', type=int)
+                    group.add_argument("--" + key, default=value, nargs='*')
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
