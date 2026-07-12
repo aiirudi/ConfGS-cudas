@@ -94,6 +94,9 @@ done
 
 mkdir -p "${OUTPUT_BASE}"
 
+METRICS_JSON="${OUTPUT_BASE}/metrics.json"
+echo '{}' > "${METRICS_JSON}"
+
 STRATEGIES=(and or abs_only conf_only weighted_score soft_fusion rfas_rank)
 
 run_experiment() {
@@ -107,13 +110,73 @@ run_experiment() {
     echo "--- [${display}] ${strategy} ---"
     echo "Dir: ${output_dir}"
 
+    # 记录训练开始时间
+    local t_start=$(date +%s)
     python train.py \
         -s "${src_path}" \
         -m "${output_dir}" \
         --candidate_selection_strategy "${strategy}" \
         ${extra_args} \
         --eval \
-        --seed "${SEED}"
+        --seed "${SEED}" \
+        --profile_components
+    local t_end=$(date +%s)
+    local elapsed=$((t_end - t_start))
+    local train_time_str="$((elapsed / 60))分$((elapsed % 60))秒"
+
+    # 自动 render + metrics（与 test.py 一致）
+    echo "--- Rendering [${display}] ${strategy} ---"
+    python render.py -m "${output_dir}"
+    echo "--- Metrics [${display}] ${strategy} ---"
+    python metrics.py -m "${output_dir}"
+
+    # 收集指标到 metrics.json，key = 策略后缀_场景名
+    local metric_key="${strategy}_${suffix}_${display}"
+    python -c "
+import json, os
+
+output_dir = '${output_dir}'
+key = '${metric_key}'
+metrics_json = '${METRICS_JSON}'
+
+with open(metrics_json) as f:
+    all_metrics = json.load(f)
+
+scene_metrics = {}
+scene_metrics['train_time'] = '${train_time_str}'
+
+# 从 results.json 提取 PSNR / SSIM / LPIPS
+results_path = os.path.join(output_dir, 'results.json')
+if os.path.exists(results_path):
+    with open(results_path) as f:
+        results = json.load(f)
+    ours_methods = [m for m in results if m.startswith('ours_')]
+    if ours_methods:
+        target = max(ours_methods, key=lambda m: int(m.split('_')[-1]))
+        scene_metrics['PSNR'] = results[target].get('PSNR', 0.0)
+        scene_metrics['SSIM'] = results[target].get('SSIM', 0.0)
+        scene_metrics['LPIPS'] = results[target].get('LPIPS', 0.0)
+    else:
+        print(f'  [WARN] No ours_* method in {results_path}')
+else:
+    print(f'  [WARN] {results_path} not found')
+
+# 从 profiler_results.json 提取额外信息
+prof_path = os.path.join(output_dir, 'profiler_results.json')
+if os.path.exists(prof_path):
+    with open(prof_path) as f:
+        prof_data = json.load(f)
+    scene_metrics['n_gaussians'] = prof_data.get('n_gaussians', 0)
+    scene_metrics['conf_time_ms'] = prof_data.get('conf_time', 0.0)
+    scene_metrics['rfas_time_ms'] = prof_data.get('rfas_time', 0.0)
+    scene_metrics['fusion_time_ms'] = prof_data.get('fusion_time', 0.0)
+
+all_metrics[key] = scene_metrics
+
+with open(metrics_json, 'w') as f:
+    json.dump(all_metrics, f, indent=True)
+print(f'  Collected {key}: {scene_metrics}')
+"
 
     echo "--- Done: [${display}] ${strategy} ---"
 }
@@ -185,6 +248,7 @@ echo ""
 echo "============================================"
 echo " 消融实验完成!"
 echo " 输出目录: ${OUTPUT_BASE}/"
+echo " 指标汇总: ${METRICS_JSON}"
 for scene in "${SCENES[@]}"; do
     display="$(scene_display_name "$scene")"
     echo "  ${display}:"
