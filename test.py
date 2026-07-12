@@ -1,5 +1,6 @@
 import os
 import json
+import time
 
 """
 paramList = [
@@ -53,12 +54,17 @@ for data, group, budget in paramList:
     src = f'{DATA_ROOT}/{group}/{data}'
     out = f'output/{data}'
 
+    t_start = time.time()
     os.system(f'python train.py -s {src} -m {out} --budget {budget} --profile_components')
+    t_end = time.time()
+    elapsed = int(t_end - t_start)
+    train_time_str = f'{elapsed // 60}分{elapsed % 60}秒'
     os.system(f'python render.py -m {out}')
     os.system(f'python metrics.py -m {out}')
 
     # Collect metrics for this scene
     scene_metrics = {}
+    scene_metrics['train_time'] = train_time_str
 
     # 1. Training PSNR (from evaluation at iteration 30000)
     # 2. Component times (from profiler)
