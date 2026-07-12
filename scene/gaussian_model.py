@@ -481,7 +481,8 @@ class GaussianModel:
 
         if iteration > 14500:
             # post-14500 统一回退：仍走 selector 统计路线以确保 CSV 字段完整
-            _rfas = rfas_score if rfas_score is not None else scores
+            # 回退策略 and 属于布尔策略, 始终用融合分数 scores (=grad_vars) 做采样权重
+            _rfas = scores  # grad_vars (回退到原始梯度幅度)
             final_mask, selection_score, _stats = select_densification_candidates(
                 abs_score=grad_vars,
                 conf_score=conf,

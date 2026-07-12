@@ -240,7 +240,7 @@ def compute_candidate_statistics(
 
     def _stats(t: torch.Tensor):
         """计算均值、标准差、中位数、min、max。"""
-        t = t[t == t]  # 排除 NaN
+        t = t[torch.isfinite(t)]  # 排除 NaN 和 Inf
         if t.numel() == 0:
             return 0.0, 0.0, 0.0, 0.0, 0.0
         return (
