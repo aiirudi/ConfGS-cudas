@@ -223,6 +223,16 @@ def check_projection(model_path, source_path, iteration):
 
     with torch.no_grad():
         gaussians = GaussianModel(args.sh_degree, optimizer_type="default")
+
+        # 检查对应 iteration 的 checkpoint 是否存在
+        ckpt_path = os.path.join(model_path, "point_cloud",
+                                 f"iteration_{args.iteration}", "point_cloud.ply")
+        if not os.path.exists(ckpt_path):
+            print(f"FAIL: checkpoint 不存在: {ckpt_path}")
+            print(f"  训练默认只保存最终 iteration 和 --save_iterations 中指定的 iteration。")
+            print(f"  请将 iteration {args.iteration} 加入 --save_iterations 后重新训练，或换个存在的 iteration。")
+            return False
+
         scene = Scene(args, gaussians, load_iteration=args.iteration, shuffle=False)
         bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
@@ -373,7 +383,7 @@ def main():
             if not src:
                 print("ERROR: --check-projection 需要 -s <source_path> 或有效的 cfg_args")
                 sys.exit(1)
-        ok = check_projection(args.check_projection, src, args.iteration)
+        ok = check_projection(args.check_projection, src, args.iteration) and ok
 
     if not args.check_artifacts and not args.check_projection:
         print("用法示例:")
