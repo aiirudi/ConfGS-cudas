@@ -477,14 +477,23 @@ class GaussianModel:
 
         # 候选点选择策略（仅 iter <= 14500 使用；之后回退到原始 abs-grad 行为）
         strategy = getattr(opt, "candidate_selection_strategy", "and")
+        num_gaussians_before = len(self.get_xyz)
+
         if iteration > 14500:
-            # post-14500 统一回退：abs_mask 作 filter，grad_vars 作 scores
-            final_mask = abs_mask
-            selection_score = scores
-            self.candidate_stats = {
-                'strategy': 'and (fallback)',
-                'iteration': iteration,
-            }
+            # post-14500 统一回退：仍走 selector 统计路线以确保 CSV 字段完整
+            _rfas = rfas_score if rfas_score is not None else scores
+            final_mask, selection_score, _stats = select_densification_candidates(
+                abs_score=grad_vars,
+                conf_score=conf,
+                rfas_score=_rfas,
+                abs_mask=abs_mask,
+                conf_mask=conf_mask,
+                strategy='and',
+                config=opt,
+            )
+            self.candidate_stats = _stats
+            self.candidate_stats['strategy'] = 'and (fallback)'
+            self.candidate_stats['iteration'] = iteration
         else:
             # rfas_score 回退到 scores（融合分数），若未传入原始 RFAS
             _rfas = rfas_score if rfas_score is not None else scores
@@ -501,9 +510,10 @@ class GaussianModel:
             self.candidate_stats['iteration'] = iteration
 
         total_sum = torch.sum(final_mask).item()
-        curr_points = len(self.get_xyz)
+        curr_points = num_gaussians_before
         budget = min(budget, total_sum + curr_points)
         all_budget = budget - curr_points
+        num_split = 0
 
         if all_budget > 0:
             self.long_axis_split(
@@ -513,11 +523,21 @@ class GaussianModel:
                 opt.split_distance,
                 opt.opacity_reduction,
             )
+            num_split = int(final_mask.sum().item())
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        
+        num_pruned = 0
+
         if iteration < 14900:
+            num_pruned = int(prune_mask.sum().item())
             self.prune_points(prune_mask)
+
+        num_gaussians_after = len(self.get_xyz)
+
+        self.candidate_stats['num_gaussians_before'] = num_gaussians_before
+        self.candidate_stats['num_gaussians_after'] = num_gaussians_after
+        self.candidate_stats['num_split'] = num_split
+        self.candidate_stats['num_pruned'] = num_pruned
 
         torch.cuda.empty_cache()
 

@@ -271,6 +271,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                             stats_path = os.path.join(args.model_path, "candidate_selection_stats.csv")
                             fieldnames = [
                                 'iteration', 'strategy',
+                                'num_gaussians_before', 'num_gaussians_after',
+                                'num_split', 'num_pruned',
                                 'n_valid', 'n_abs_candidates', 'n_conf_candidates',
                                 'n_and_candidates', 'n_or_candidates', 'n_final_candidates',
                                 'candidate_ratio', 'target_budget', 'actual_budget',
@@ -895,6 +897,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--cams", type=int, default=10)
     parser.add_argument("--websockets", action='store_true', default=False)
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -902,6 +905,13 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    if args.seed is not None:
+        import random
+        import numpy as np
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     if(args.websockets):
         network_gui_ws.init(args.ip, args.port)

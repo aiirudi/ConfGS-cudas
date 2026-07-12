@@ -41,6 +41,27 @@ def _count(t: torch.Tensor) -> int:
     return int((t > 0).sum().item())
 
 
+def _finite_valid_mask(*tensors: torch.Tensor) -> torch.Tensor:
+    """
+    构造统一有限有效掩码：所有输入张量都 finite 且不为 NaN。
+    返回形状与第一个输入相同的 bool Tensor。
+    """
+    ref = tensors[0]
+    if ref.numel() == 0:
+        return torch.zeros_like(ref, dtype=torch.bool)
+    mask = torch.ones(ref.shape, dtype=torch.bool, device=ref.device)
+    for t in tensors:
+        t_flat = t.reshape(ref.shape[0], -1)
+        for d in range(t_flat.shape[1]):
+            col = t_flat[:, d]
+            mask = mask & (~torch.isnan(col)) & (~torch.isinf(col))
+    return mask
+
+
+# 布尔掩码策略集合
+_BOOLEAN_STRATEGIES = {'and', 'or', 'abs_only', 'conf_only'}
+
+
 def normalize_scores(
     scores: torch.Tensor,
     method: str = 'percentile',
@@ -279,72 +300,78 @@ def apply_fixed_budget(
     target_budget: int,
     budget_reference: str,
     config,
-) -> Tuple[torch.Tensor, int]:
+    strategy: str = 'and',
+) -> Tuple[torch.Tensor, int, int]:
     """
     将候选掩码约束到固定预算。
 
-    对于布尔掩码策略（and/or/abs_only/conf_only）：
+    布尔掩码策略（and/or/abs_only/conf_only）：
       仅在满足掩码条件的点内按 scores 排序选 top-k；
-      若满足掩码的点数不足目标预算，不补入。
-    对于连续分数策略（weighted_score/soft_fusion/rfas_rank）：
-      scores 对所有点都有意义，当掩码点数不足目标预算时，
-      从所有分数 > 0 的有效点中按 scores 选 top-k。
+      若满足掩码的点数不足目标预算，决不补入掩码外的点。
+    连续分数策略（weighted_score/soft_fusion/rfas_rank）：
+      掩码点数不足时从所有 finite-valid 的点中按 scores 补足。
 
     Args:
         mask: (N,) bool，原始候选掩码
-        scores: (N,) 连续排序分数
-        target_budget: 目标候选数量
+        scores: (N,) 连续排序分数（已 sanitized: 无 NaN/Inf）
+        target_budget: 已解析的目标候选数量
         budget_reference: 'fixed_number' | 'fixed_ratio' | 'match_and'
         config: OptimizationParams
+        strategy: 当前策略标识
 
     Returns:
         adjusted_mask: (N,) bool
         actual_budget: 实际选中的候选数量
+        resolved_target: 解析后的目标预算（用于日志）
     """
     N = mask.numel()
 
     if budget_reference == 'fixed_number':
-        k = getattr(config, 'candidate_fixed_budget', 1000)
-        k = min(k, N)
+        resolved = getattr(config, 'candidate_fixed_budget', 1000)
     elif budget_reference == 'fixed_ratio':
         ratio = getattr(config, 'candidate_fixed_ratio', 0.05)
-        k = max(1, int(ratio * N))
+        resolved = max(1, int(ratio * N))
     elif budget_reference == 'match_and':
-        k = target_budget
+        resolved = target_budget
     else:
-        k = target_budget
+        resolved = target_budget
 
-    k = min(k, N)
+    k = min(resolved, N)
+    is_boolean = strategy in _BOOLEAN_STRATEGIES
     n_in_mask = _count(mask)
 
     if k == 0:
-        return torch.zeros(N, dtype=torch.bool, device=mask.device), 0
+        return torch.zeros(N, dtype=torch.bool, device=mask.device), 0, resolved
 
     if k <= n_in_mask:
-        # 在满足掩码的点内按 scores 排序选 top-k
+        # 掩码内点数足够：在掩码内选 top-k
         work_scores = scores.clone()
         work_scores[~mask] = float('-inf')
         _, top_indices = torch.topk(work_scores, k)
         adjusted = torch.zeros(N, dtype=torch.bool, device=mask.device)
         adjusted[top_indices] = True
         actual_budget = k
+    elif is_boolean:
+        # 布尔策略：掩码不足绝不补入，返回掩码内的全部点
+        adjusted = mask.clone()
+        actual_budget = n_in_mask
     else:
-        # 掩码点数不足 — 从所有 scores > -inf 的有效点中选 top-k
+        # 连续策略：从所有 finite-valid 的点中补足（优先保留掩码内点）
         work_scores = scores.clone()
-        bad = torch.isnan(work_scores) | torch.isinf(work_scores)
-        work_scores[bad] = float('-inf')
-        # 优先保留掩码内的点（设为最大值确保入选）
-        work_scores[mask] = work_scores[mask] + work_scores.max().abs() + 1.0
-        n_valid = (work_scores > float('-inf')).sum().item()
-        k = min(k, max(int(n_valid), 0))
+        # 优先保留掩码内的点（加分使其在 topk 中排前）
+        if n_in_mask > 0:
+            offset = work_scores.max().abs() + 1.0
+            work_scores[mask] = work_scores[mask] + offset
+        n_valid = _count(work_scores > float('-inf')) if scores.numel() > 0 else 0
+        k = min(k, max(n_valid, 0))
         if k <= 0:
-            return mask, int(mask.sum().item())
+            return mask.clone(), n_in_mask, resolved
         _, top_indices = torch.topk(work_scores, k)
         adjusted = torch.zeros(N, dtype=torch.bool, device=mask.device)
         adjusted[top_indices] = True
         actual_budget = k
 
-    return adjusted, actual_budget
+    return adjusted, actual_budget, resolved
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +600,11 @@ def select_densification_candidates(
     if selection_score.device != device:
         selection_score = selection_score.to(device)
 
+    # 构造 finite-valid mask，统一从 final_mask 和 selection_score 中排除 NaN/Inf
+    finite_mask = _finite_valid_mask(selection_score, abs_score.squeeze(), conf_score, rfas_score)
+    final_mask = final_mask & finite_mask
+    selection_score[~finite_mask] = 0.0
+
     # 应用固定预算（如果配置了）
     budget_mode = getattr(config, 'candidate_budget_mode', 'native')
     budget_ref = getattr(config, 'candidate_budget_reference', 'match_and')
@@ -582,24 +614,37 @@ def select_densification_candidates(
         # 确定目标预算
         if budget_ref == 'match_and':
             # match_and: 目标预算 = AND 掩码的候选数
-            # 内部运行 AND 策略获取基线
             and_mask, _and_scores = _strategy_and(
                 abs_mask=abs_mask, conf_mask=conf_mask,
                 abs_score=abs_score, conf_score=conf_score,
                 rfas_score=rfas_score, config=config,
             )
+            # AND 基线也要排除 NaN/Inf
+            and_mask = and_mask & finite_mask
             target_budget = int(and_mask.sum().item())
+            resolved_target = target_budget
+        elif budget_ref == 'fixed_number':
+            resolved_target = getattr(config, 'candidate_fixed_budget', 1000)
+            target_budget = resolved_target
+        elif budget_ref == 'fixed_ratio':
+            ratio = getattr(config, 'candidate_fixed_ratio', 0.05)
+            resolved_target = max(1, int(ratio * final_mask.numel()))
+            target_budget = resolved_target
         else:
             target_budget = actual_budget
+            resolved_target = target_budget
 
-        final_mask, actual_budget = apply_fixed_budget(
+        final_mask, actual_budget, __resolved = apply_fixed_budget(
             final_mask, selection_score,
             target_budget=target_budget,
             budget_reference=budget_ref,
             config=config,
+            strategy=strategy,
         )
+        resolved_target = __resolved
     else:
         target_budget = actual_budget
+        resolved_target = target_budget
 
     # 收集统计信息（no_grad 避免污染计算图）
     stats = compute_candidate_statistics(
@@ -611,7 +656,7 @@ def select_densification_candidates(
         conf_mask=conf_mask,
         final_mask=final_mask,
         selection_score=selection_score,
-        target_budget=target_budget,
+        target_budget=resolved_target,
         actual_budget=actual_budget,
     )
 

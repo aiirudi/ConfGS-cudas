@@ -141,7 +141,7 @@ class OptimizationParams(ParamGroup):
         # 归一化方式: minmax | zscore | percentile
         self.candidate_score_normalization = 'percentile'
         # 连续分数的选择方式: threshold | topk
-        self.candidate_score_selection = 'topk'
+        self.candidate_score_selection = 'threshold'
         # threshold 模式的阈值
         self.candidate_score_threshold = 0.5
         # topk 模式的绝对数量 (0 = 使用 ratio)
