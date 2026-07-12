@@ -5,12 +5,17 @@
 # Usage:
 #   bash scripts/run_candidate_ablation.sh [SEED] [SCENE...]
 #
-#   SEED:   随机种子 (默认: 0)
-#   SCENE:  数据集名称 (默认: garden)，可多个，如: train truck
+#   SEED:  随机种子 (默认: 0)
+#   SCENE: 完整数据路径，如 /workspace/dataset/tt/train
+#          或简写场景名（自动从 DATA_ROOT 查找对应 group）
+#          简写支持的场景: bicycle flowers garden stump treehill
+#                          bonsai counter kitchen room
+#                          drjohnson playroom
+#                          train truck
 #
 # 示例:
+#   bash scripts/run_candidate_ablation.sh 0 /workspace/dataset/tt/train /workspace/dataset/tt/truck
 #   bash scripts/run_candidate_ablation.sh 0 train truck
-#   bash scripts/run_candidate_ablation.sh 0 garden bicycle flowers
 set -e
 
 SEED="${1:-0}"
@@ -21,21 +26,68 @@ if [ ${#SCENES[@]} -eq 0 ]; then
 fi
 
 ALPHA="0.5"
+DATA_ROOT="/workspace/dataset"
 OUTPUT_BASE="output/candidate_ablation"
+
+# 场景到 group 的映射（与 test.py paramList 一致）
+declare -A SCENE_GROUP
+SCENE_GROUP[bicycle]="mipnerf"
+SCENE_GROUP[flowers]="mipnerf"
+SCENE_GROUP[garden]="mipnerf"
+SCENE_GROUP[stump]="mipnerf"
+SCENE_GROUP[treehill]="mipnerf"
+SCENE_GROUP[bonsai]="mipnerf"
+SCENE_GROUP[counter]="mipnerf"
+SCENE_GROUP[kitchen]="mipnerf"
+SCENE_GROUP[room]="mipnerf"
+SCENE_GROUP[drjohnson]="db"
+SCENE_GROUP[playroom]="db"
+SCENE_GROUP[train]="tt"
+SCENE_GROUP[truck]="tt"
+
+# 解析场景路径：完整路径直接使用，简写名拼接 DATA_ROOT
+resolve_scene() {
+    local input="$1"
+    # 如果包含 /，当作完整路径
+    if [[ "$input" == */* ]]; then
+        echo "$input"
+        return
+    fi
+    # 简写：查 group
+    local group="${SCENE_GROUP[$input]}"
+    if [ -z "$group" ]; then
+        echo "ERROR: 未知场景 '$input'，请使用完整路径或支持的简写: ${!SCENE_GROUP[*]}" >&2
+        exit 1
+    fi
+    echo "${DATA_ROOT}/${group}/${input}"
+}
+
+# 显示名（用于输出目录）
+scene_display_name() {
+    local input="$1"
+    if [[ "$input" == */* ]]; then
+        basename "$input"
+    else
+        echo "$input"
+    fi
+}
 
 echo "============================================"
 echo " 候选选择策略消融实验"
-echo " Scenes: ${SCENES[*]}"
 echo " Seed:   ${SEED}"
 echo " Alpha:  ${ALPHA}"
+echo " Data:   ${DATA_ROOT}"
+echo " Scenes:"
+for scene in "${SCENES[@]}"; do
+    echo "         $(resolve_scene "$scene")"
+done
 echo "============================================"
 
 # 验证所有场景存在
 for scene in "${SCENES[@]}"; do
-    if [ ! -d "data/${scene}" ]; then
-        echo "ERROR: 数据集不存在: data/${scene}"
-        echo "可用数据集:"
-        ls data/ 2>/dev/null || echo "  (无)"
+    src="$(resolve_scene "$scene")"
+    if [ ! -d "$src" ]; then
+        echo "ERROR: 数据集不存在: $src"
         exit 1
     fi
 done
@@ -48,21 +100,22 @@ run_experiment() {
     local strategy="$1"
     local extra_args="$2"
     local output_dir="$3"
-    local scene="$4"
+    local src_path="$4"
+    local display="$5"
 
     echo ""
-    echo "--- [${scene}] ${strategy} ---"
+    echo "--- [${display}] ${strategy} ---"
     echo "Dir: ${output_dir}"
 
     python train.py \
-        -s "data/${scene}" \
+        -s "${src_path}" \
         -m "${output_dir}" \
         --candidate_selection_strategy "${strategy}" \
         ${extra_args} \
         --eval \
         --seed "${SEED}"
 
-    echo "--- Done: [${scene}] ${strategy} ---"
+    echo "--- Done: [${display}] ${strategy} ---"
 }
 
 # ---- Phase 1: Native Budget Mode ----
@@ -90,8 +143,10 @@ for strategy in "${STRATEGIES[@]}"; do
     esac
 
     for scene in "${SCENES[@]}"; do
-        output_dir="${OUTPUT_BASE}/${scene}/${strategy}_${suffix}_seed${SEED}"
-        run_experiment "${strategy}" "${extra_args}" "${output_dir}" "${scene}"
+        src="$(resolve_scene "$scene")"
+        display="$(scene_display_name "$scene")"
+        output_dir="${OUTPUT_BASE}/${display}/${strategy}_${suffix}_seed${SEED}"
+        run_experiment "${strategy}" "${extra_args}" "${output_dir}" "${src}" "${display}"
     done
 done
 
@@ -119,8 +174,10 @@ for strategy in "${STRATEGIES[@]}"; do
     esac
 
     for scene in "${SCENES[@]}"; do
-        output_dir="${OUTPUT_BASE}/${scene}/${strategy}_${suffix}_seed${SEED}"
-        run_experiment "${strategy}" "${extra_args}" "${output_dir}" "${scene}"
+        src="$(resolve_scene "$scene")"
+        display="$(scene_display_name "$scene")"
+        output_dir="${OUTPUT_BASE}/${display}/${strategy}_${suffix}_seed${SEED}"
+        run_experiment "${strategy}" "${extra_args}" "${output_dir}" "${src}" "${display}"
     done
 done
 
@@ -129,7 +186,8 @@ echo "============================================"
 echo " 消融实验完成!"
 echo " 输出目录: ${OUTPUT_BASE}/"
 for scene in "${SCENES[@]}"; do
-    echo "  ${scene}:"
-    ls -d ${OUTPUT_BASE}/${scene}/*_seed${SEED}/ 2>/dev/null || echo "    (无)"
+    display="$(scene_display_name "$scene")"
+    echo "  ${display}:"
+    ls -d ${OUTPUT_BASE}/${display}/*_seed${SEED}/ 2>/dev/null || echo "    (无)"
 done
 echo "============================================"
