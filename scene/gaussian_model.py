@@ -539,7 +539,7 @@ class GaussianModel:
                 opt.split_distance,
                 opt.opacity_reduction,
             )
-            num_split = int(final_mask.sum().item())
+            num_split = min(all_budget, int(final_mask.sum().item()))
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         num_pruned = 0

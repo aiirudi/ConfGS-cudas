@@ -193,10 +193,10 @@ def test_nan_inf_strategy_exclusion():
         assert not mask[20], f"{strat}: +Inf point in mask"
         assert not mask[30], f"{strat}: -Inf point in mask"
 
-        # selection_score 在这些位置应为 0（finite mask 清除了）
-        assert scores[10].item() == 0.0, f"{strat}: NaN score not zeroed"
-        assert scores[20].item() == 0.0, f"{strat}: +Inf score not zeroed"
-        assert scores[30].item() == 0.0, f"{strat}: -Inf score not zeroed"
+        # selection_score 在这些位置应为 -inf（finite mask 将其标记为不可选）
+        assert torch.isinf(scores[10]) and scores[10].item() < 0, f"{strat}: NaN score not -inf"
+        assert torch.isinf(scores[20]) and scores[20].item() < 0, f"{strat}: +Inf score not -inf"
+        assert torch.isinf(scores[30]) and scores[30].item() < 0, f"{strat}: -Inf score not -inf"
     print("  PASS test_nan_inf_strategy_exclusion")
 
 
