@@ -225,12 +225,12 @@ def _voxel_diversity_select(
     voxel_scale: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict]:
     """
-    体素轮转选择核心逻辑。
+    体素轮转选择核心逻辑（全向量化版本）。
 
     1. 计算体素尺寸 (自动或指定)
     2. 对候选坐标进行体素分区
-    3. 每体素内按分数降序排列
-    4. 轮转选取，直到达到 budget
+    3. CPU stable sort: 体素内按 (-score, global_index)、体素间按 (-top_score, i, j, k)
+    4. 单次向量化 sort 计算 round-robin 选择顺序，取 top-budget
 
     Args:
         cand_indices: (K,) long, 候选 Gaussian 的全局索引
@@ -246,6 +246,7 @@ def _voxel_diversity_select(
         stats: dict
     """
     K = cand_indices.numel()
+    device = cand_indices.device
     cand_xyz = xyz[cand_indices]  # (K, 3)
     cand_scores = priority_scores[cand_indices]  # (K,)
 
@@ -254,7 +255,6 @@ def _voxel_diversity_select(
         if scales is not None:
             voxel_size = _compute_adaptive_voxel_size(scales, cand_indices, voxel_scale=voxel_scale)
         else:
-            # 无 scale 信息，回退到场景范围的简单启发
             xyz_range = cand_xyz.max(dim=0).values - cand_xyz.min(dim=0).values
             voxel_size = max(xyz_range.max().item() * 0.02, 0.01)
     voxel_size = max(voxel_size, EPS)
@@ -263,102 +263,82 @@ def _voxel_diversity_select(
     xyz_min = cand_xyz.min(dim=0).values  # (3,)
     voxel_ijk = ((cand_xyz - xyz_min) / voxel_size).long()  # (K, 3)
 
-    # 确定网格范围
     v_max = voxel_ijk.max(dim=0).values  # (3,)
     nx = int(v_max[0].item()) + 1
     ny = int(v_max[1].item()) + 1
-    # 编码为 1D: v = i + j*nx + k*nx*ny
     voxel_1d = (voxel_ijk[:, 0].long()
                 + voxel_ijk[:, 1].long() * nx
                 + voxel_ijk[:, 2].long() * nx * ny)  # (K,)
 
-    # 3. 对每个体素按 (score降序, global_index升序) 排序
-    # 体素内使用  Python sorted (tuples 键是稳定的且支持确定性 lexicographic 排序)
-    # 体素遍历也使用确定性复合键
-    unique_voxels, inverse_indices, counts = torch.unique(
-        voxel_1d, return_inverse=True, return_counts=True
-    )
-    n_voxels = unique_voxels.numel()
+    # 3. CPU 多遍 stable sort: 按 (voxel_1d, -score, global_index) 排序
+    #    最后一道 sort 是主键 → 先排体素, 体内按分数降序, tie-breaker 按 global_index 升序
+    cand_indices_cpu = cand_indices.cpu()
+    cand_scores_cpu = cand_scores.cpu()
+    voxel_1d_cpu = voxel_1d.cpu()
+    voxel_ijk_cpu = voxel_ijk.cpu()
 
-    # 4. 为每个体素构建有序候选列表
-    occupied_voxel_count = 0
-    voxel_entries = []  # list of (sorted_global_list, voxel_ijk_tuple, top_score)
+    idx = torch.arange(K)  # CPU
+    idx = idx[torch.sort(cand_indices_cpu[idx], stable=True).indices]    # 第三键: global_index
+    idx = idx[torch.sort(-cand_scores_cpu[idx], stable=True).indices]     # 第二键: -score
+    idx = idx[torch.sort(voxel_1d_cpu[idx], stable=True).indices]         # 主键: voxel_1d
 
-    for v_idx in range(n_voxels):
-        n_in = int(counts[v_idx].item())
-        if n_in == 0:
-            continue
-        occupied_voxel_count += 1
+    idx = idx.to(device)
+    sorted_voxel_1d = voxel_1d[idx]       # (K,) 按体素分组
+    sorted_global = cand_indices[idx]      # (K,) 全局索引
+    sorted_scores = cand_scores[idx]       # (K,) 分数
 
-        in_voxel = (inverse_indices == v_idx)  # (K,)
-        v_global = cand_indices[in_voxel]  # 该体素中候选的全局索引
-        v_scores = cand_scores[in_voxel]  # 该体素中候选的分数 (原始, 不含 NaN/Inf)
+    # 4. 体素边界与体内 rank
+    is_new_voxel = torch.cat([
+        torch.tensor([True], device=device),
+        sorted_voxel_1d[1:] != sorted_voxel_1d[:-1],
+    ])  # (K,)
+    voxel_start = torch.where(is_new_voxel)[0]                    # (n_voxels,)
+    n_occupied = voxel_start.numel()
+    voxel_of_pos = torch.cumsum(is_new_voxel.long(), dim=0) - 1  # (K,): 每个位置属于第几个体素
 
-        # 按 (-score, global_index) 确定性排序
-        # 使用 Python sorted: tuples 键, 词法排序
-        scored_pairs = [
-            (float(v_scores[i].item()), int(v_global[i].item()))
-            for i in range(n_in)
-        ]
-        # 降序按 score, 升序按 index (tie-breaker)
-        scored_pairs.sort(key=lambda x: (-x[0], x[1]))
-        sorted_global_indices = torch.tensor(
-            [p[1] for p in scored_pairs], dtype=torch.long, device=cand_indices.device
-        )
+    # 扩展 voxel_start 到 (K,) 用于计算体内 rank
+    intra_rank = torch.arange(K, device=device) - voxel_start[voxel_of_pos]  # (K,)
 
-        # 体素 3D 坐标 (用于确定性体素遍历)
-        # 取体素内第一个候选的 ijk 坐标
-        first_in_voxel = torch.where(in_voxel)[0][0]
-        v_i = int(voxel_ijk[first_in_voxel, 0].item())
-        v_j = int(voxel_ijk[first_in_voxel, 1].item())
-        v_k = int(voxel_ijk[first_in_voxel, 2].item())
+    # 5. 体素遍历顺序: 按 (-top_score, i, j, k) 对体素排序
+    top_scores = sorted_scores[voxel_start]                              # (n_voxels,)
+    top_ijk = voxel_ijk[idx[voxel_start]]                                # (n_voxels, 3)
 
-        top_score = scored_pairs[0][0] if scored_pairs else float('-inf')
-        voxel_entries.append((sorted_global_indices, (v_i, v_j, v_k), top_score))
+    top_scores_cpu = top_scores.cpu()
+    top_ijk_cpu = top_ijk.cpu()
+    vox_order = torch.arange(n_occupied)  # CPU
+    vox_order = vox_order[torch.sort(top_ijk_cpu[vox_order, 2].float(), stable=True).indices]  # k
+    vox_order = vox_order[torch.sort(top_ijk_cpu[vox_order, 1].float(), stable=True).indices]  # j
+    vox_order = vox_order[torch.sort(top_ijk_cpu[vox_order, 0].float(), stable=True).indices]  # i
+    vox_order = vox_order[torch.sort(-top_scores_cpu[vox_order], stable=True).indices]         # -top_score
 
-    # 5. 确定性体素遍历顺序: (-top_score, voxel_i, voxel_j, voxel_k)
-    voxel_entries.sort(key=lambda e: (-e[2], e[1][0], e[1][1], e[1][2]))
+    vox_order = vox_order.to(device)
+    voxel_rank = torch.empty(n_occupied, dtype=torch.long, device=device)
+    voxel_rank[vox_order] = torch.arange(n_occupied, device=device)  # 体素遍历位次
 
-    # 6. 轮转选择 (不丢弃零/负分数 — 后处理器负责 clamp)
-    selected_global = []
-    round_idx = 0
+    # 6. Round-robin 选择顺序 (单次 sort, 无 while 循环)
+    #    round_num = torch.div(intra_rank, max_per_voxel, rounding_mode='floor')
+    #    sel_order = round_num * n_voxels * max_per_voxel + voxel_rank * max_per_voxel + pos_in_round
+    round_num = torch.div(intra_rank, max_per_voxel, rounding_mode='floor')
+    pos_in_round = intra_rank % max_per_voxel
+    sel_order = (round_num * n_occupied * max_per_voxel
+                 + voxel_rank[voxel_of_pos] * max_per_voxel
+                 + pos_in_round)  # (K,)
 
-    while len(selected_global) < budget:
-        any_selected_this_round = False
+    _, sel_pos = torch.sort(sel_order)
+    selected_global = sorted_global[sel_pos[:budget]]  # (budget,)
 
-        for sorted_indices, _voxel_key, _top in voxel_entries:
-            if len(selected_global) >= budget:
-                break
-            n_available = sorted_indices.numel()
-            start = round_idx * max_per_voxel
-            end = min(start + max_per_voxel, n_available)
-            for pos in range(start, end):
-                if len(selected_global) >= budget:
-                    break
-                selected_global.append(int(sorted_indices[pos].item()))
-                any_selected_this_round = True
-
-        if not any_selected_this_round:
-            break
-        round_idx += 1
-
-    # 7. 构建输出
-    device = cand_indices.device
-    if len(selected_global) == 0:
-        selected_indices = torch.zeros(0, dtype=torch.long, device=device)
-    else:
-        selected_indices = torch.tensor(selected_global, dtype=torch.long, device=device)
-
-    # 统计体素内候选分布
-    counts_list = [int(counts[i].item()) for i in range(n_voxels) if counts[i].item() > 0]
-    max_candidates = max(counts_list) if counts_list else 0
-    mean_candidates = sum(counts_list) / max(len(counts_list), 1)
+    # 7. 统计
+    voxel_sizes = torch.diff(torch.cat([
+        voxel_start, torch.tensor([K], device=device)
+    ]))  # (n_voxels,)
+    max_candidates = int(voxel_sizes.max().item())
+    mean_candidates = float(voxel_sizes.float().mean().item())
 
     stats = {
-        'occupied_voxel_count': occupied_voxel_count,
+        'occupied_voxel_count': n_occupied,
         'max_candidates_per_voxel': max_candidates,
-        'mean_candidates_per_voxel': float(mean_candidates),
+        'mean_candidates_per_voxel': mean_candidates,
         'voxel_size': float(voxel_size),
     }
 
-    return selected_indices, stats
+    return selected_global, stats

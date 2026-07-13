@@ -534,8 +534,11 @@ class GaussianModel:
 
         # ---- 空间多样性候选选择器 (后处理模块) ----
         # 在可视化之后、long_axis_split 之前运行，确保可视化显示原始候选
-        # 默认关闭 (enable_spatial_diversity=False)，不影响原始代码路径
-        if getattr(opt, 'enable_spatial_diversity', False) and all_budget > 0 and iteration <= 14500:
+        # 通过 enable_spatial_diversity 控制总开关，spatial_interval 控制执行频率
+        if (getattr(opt, 'enable_spatial_diversity', False)
+                and all_budget > 0
+                and iteration <= 14500
+                and iteration % getattr(opt, 'spatial_interval', 100) == 0):
             from utils.spatial_diversity import select_spatially_diverse_candidates
 
             # 解析体素尺寸: 'auto' 或非正数 → 自适应; 正数 → 固定值
