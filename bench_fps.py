@@ -392,7 +392,7 @@ def main():
                 print(f"\n    FPS variance across views: ±{np.std(view_fps_list):.2f}\n")
 
         # JSON Output
-        json_path = args.fps_output
+        json_path = getattr(args, 'fps_output', None)
         if json_path is None:
             json_path = os.path.join(dataset.model_path, "fps_benchmark.json")
         save_fps_json(
