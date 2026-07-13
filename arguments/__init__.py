@@ -166,7 +166,7 @@ class OptimizationParams(ParamGroup):
         # 是否启用空间多样性模块 (默认关闭, 可通过代码或 --enable_spatial_diversity 开启)
         self.enable_spatial_diversity = False
         # 体素选择执行间隔 (iterations), 默认 100 = 每次 densification 都执行
-        self.spatial_interval = 1000
+        self.spatial_interval = 100
         # 空间选择方法: voxel | radius_nms | soft_suppression
         self.spatial_diversity_method = 'voxel'
         # 体素尺寸: 'auto' = 自动从 scale 计算; 数值字符串如 '0.5' 也可

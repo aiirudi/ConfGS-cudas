@@ -48,9 +48,8 @@ for SCENE in ${SCENES}; do
         --candidate_selection_strategy "${CANDIDATE_STRATEGY}" || { echo "FAIL baseline ${SCENE}"; continue; }
     T1=$(date +%s)
     BTIME=$((T1 - T0))
-    python render.py -m "${BASELINE_DIR}" --skip_train 2>/dev/null || true
-    python metrics.py -m "${BASELINE_DIR}" 2>/dev/null || true
-
+    python render.py -m "${BASELINE_DIR}" --skip_train
+    python metrics.py -m "${BASELINE_DIR}"
     # ---- Spatial Voxel ----
     echo "[2/2] Spatial Voxel (ON)"
     T0=$(date +%s)
@@ -61,9 +60,8 @@ for SCENE in ${SCENES}; do
         || { echo "FAIL spatial ${SCENE}"; continue; }
     T1=$(date +%s)
     STIME=$((T1 - T0))
-    python render.py -m "${SPATIAL_DIR}" --skip_train 2>/dev/null || true
-    python metrics.py -m "${SPATIAL_DIR}" 2>/dev/null || true
-
+    python render.py -m "${SPATIAL_DIR}" --skip_train
+    python metrics.py -m "${SPATIAL_DIR}"
     # ---- Python aggregation ----
     python3 << PYEOF
 import json, csv, os
