@@ -74,28 +74,34 @@ def select_spatially_diverse_candidates(
         raise ValueError(
             f"Unknown method: '{method}'. Valid options: voxel, radius_nms, soft_suppression"
         )
+    if max_per_voxel < 1:
+        raise ValueError(
+            f"max_per_voxel must be >= 1, got {max_per_voxel}"
+        )
 
-    # ---- 筛选候选 ----
-    cand_indices = candidate_mask.nonzero(as_tuple=False).squeeze(-1)  # (K,)
+    # ---- 筛选候选 (排除 NaN/Inf, 保留零/负分数) ----
+    finite_mask = candidate_mask & torch.isfinite(priority_scores)
+    cand_indices = finite_mask.nonzero(as_tuple=False).squeeze(-1)  # (K,)
+    n_candidates_input = int(candidate_mask.sum().item())
     n_candidates = cand_indices.numel()
 
     # ---- 边缘情况 ----
     if n_candidates == 0 or budget <= 0:
         runtime_ms = (time.time() - t_start) * 1000.0
         return torch.zeros(N, dtype=torch.bool, device=candidate_mask.device), {
-            'candidate_count': n_candidates,
+            'candidate_count': n_candidates_input,
             'selected_count': 0,
             'occupied_voxel_count': 0,
             'max_candidates_per_voxel': 0,
             'mean_candidates_per_voxel': 0.0,
             'voxel_size': voxel_size if voxel_size is not None else 0.0,
-            'spatial_runtime_ms': runtime_ms,
+            'runtime_ms': runtime_ms,
             'jaccard_vs_original': 0.0,
             'replaced_count': 0,
             'method': method,
         }
 
-    # 解析目标选择数量
+    # 解析目标选择数量 (有限候选范围内)
     budget = min(budget, n_candidates)
 
     # ---- 分流到具体方法 ----
@@ -126,7 +132,7 @@ def select_spatially_diverse_candidates(
     spatial_mask[spatial_indices] = True
 
     # ---- 计算原 EAS top-budget 集合 (用于统计 Jaccard 等) ----
-    # 原始 EAS 按 priority_scores 选 top-budget (仅在 candidate_mask 内)
+    # 原始 EAS 按 priority_scores 选 top-budget (仅在 candidate_mask 内, 排除 NaN/Inf)
     work_scores = priority_scores.clone()
     work_scores[~candidate_mask] = float('-inf')
     bad = torch.isnan(work_scores) | torch.isinf(work_scores)
@@ -147,13 +153,13 @@ def select_spatially_diverse_candidates(
     runtime_ms = (time.time() - t_start) * 1000.0
 
     stats = {
-        'candidate_count': n_candidates,
+        'candidate_count': n_candidates_input,
         'selected_count': int(spatial_mask.sum().item()),
         'occupied_voxel_count': method_stats.get('occupied_voxel_count', 0),
         'max_candidates_per_voxel': method_stats.get('max_candidates_per_voxel', 0),
         'mean_candidates_per_voxel': method_stats.get('mean_candidates_per_voxel', 0.0),
         'voxel_size': method_stats.get('voxel_size', 0.0),
-        'spatial_runtime_ms': runtime_ms,
+        'runtime_ms': runtime_ms,
         'jaccard_vs_original': jaccard,
         'replaced_count': replaced_count,
         'method': method,
@@ -173,6 +179,7 @@ def select_spatially_diverse_candidates(
 # ---------------------------------------------------------------------------
 
 
+@torch.no_grad()
 def _compute_adaptive_voxel_size(
     scales: torch.Tensor,
     candidate_indices: torch.Tensor,
@@ -264,75 +271,70 @@ def _voxel_diversity_select(
                 + voxel_ijk[:, 1].long() * nx
                 + voxel_ijk[:, 2].long() * nx * ny)  # (K,)
 
-    # 3. 按 (voxel_id, score) 联合排序
-    # 先将 NaN/Inf score 设为 -inf (不会被选中)
-    work_scores = cand_scores.clone()
-    bad = torch.isnan(work_scores) | torch.isinf(work_scores)
-    work_scores[bad] = float('-inf')
-
-    # 排序: 按 voxel_id 优先，再按 score 降序，再按原始索引 (tie-breaker)
-    # 使用 argsort 的复合键: 需要稳定的 GPU 排序
-    # 方案: 对每个体素单独处理
+    # 3. 对每个体素按 (score降序, global_index升序) 排序
+    # 体素内使用  Python sorted (tuples 键是稳定的且支持确定性 lexicographic 排序)
+    # 体素遍历也使用确定性复合键
     unique_voxels, inverse_indices, counts = torch.unique(
         voxel_1d, return_inverse=True, return_counts=True
     )
     n_voxels = unique_voxels.numel()
 
-    # 4. 对每个体素内按 score 降序排列
-    # 为每个 voxel 维护一个候选列表和当前指针
+    # 4. 为每个体素构建有序候选列表
     occupied_voxel_count = 0
-    voxel_candidates = []  # list of (score, global_idx) 列表的列表
-    voxel_scores = []  # 每个体素的最高分 (用于体素优先级排序)
+    voxel_entries = []  # list of (sorted_global_list, voxel_ijk_tuple, top_score)
 
     for v_idx in range(n_voxels):
-        in_voxel = (inverse_indices == v_idx)  # (K,)
         n_in = int(counts[v_idx].item())
         if n_in == 0:
             continue
         occupied_voxel_count += 1
 
+        in_voxel = (inverse_indices == v_idx)  # (K,)
         v_global = cand_indices[in_voxel]  # 该体素中候选的全局索引
-        v_scores = work_scores[in_voxel]  # 该体素中候选的分数
+        v_scores = cand_scores[in_voxel]  # 该体素中候选的分数 (原始, 不含 NaN/Inf)
 
-        # 按 score 降序，索引 (tie-breaker)
-        # PyTorch 1.12.1 不支持 stable sort, 使用 descending argsort
-        sort_order = torch.argsort(v_scores, descending=True)
-        sorted_global = v_global[sort_order]  # (n_in,)
-        sorted_scores = v_scores[sort_order]  # (n_in,)
+        # 按 (-score, global_index) 确定性排序
+        # 使用 Python sorted: tuples 键, 词法排序
+        scored_pairs = [
+            (float(v_scores[i].item()), int(v_global[i].item()))
+            for i in range(n_in)
+        ]
+        # 降序按 score, 升序按 index (tie-breaker)
+        scored_pairs.sort(key=lambda x: (-x[0], x[1]))
+        sorted_global_indices = torch.tensor(
+            [p[1] for p in scored_pairs], dtype=torch.long, device=cand_indices.device
+        )
 
-        voxel_candidates.append((sorted_global, sorted_scores))
-        # 体素的"优先级分数" = 体素内最高分
-        top_score = sorted_scores[0].item() if n_in > 0 else float('-inf')
-        voxel_scores.append(top_score)
+        # 体素 3D 坐标 (用于确定性体素遍历)
+        # 取体素内第一个候选的 ijk 坐标
+        first_in_voxel = torch.where(in_voxel)[0][0]
+        v_i = int(voxel_ijk[first_in_voxel, 0].item())
+        v_j = int(voxel_ijk[first_in_voxel, 1].item())
+        v_k = int(voxel_ijk[first_in_voxel, 2].item())
 
-    # 5. 按体素优先级排序: 高分体素优先遍历
-    voxel_order = sorted(
-        range(len(voxel_candidates)),
-        key=lambda i: voxel_scores[i],
-        reverse=True,
-    )
+        top_score = scored_pairs[0][0] if scored_pairs else float('-inf')
+        voxel_entries.append((sorted_global_indices, (v_i, v_j, v_k), top_score))
 
-    # 6. 轮转选择
+    # 5. 确定性体素遍历顺序: (-top_score, voxel_i, voxel_j, voxel_k)
+    voxel_entries.sort(key=lambda e: (-e[2], e[1][0], e[1][1], e[1][2]))
+
+    # 6. 轮转选择 (不丢弃零/负分数 — 后处理器负责 clamp)
     selected_global = []
     round_idx = 0
 
     while len(selected_global) < budget:
         any_selected_this_round = False
 
-        for v_idx in voxel_order:
+        for sorted_indices, _voxel_key, _top in voxel_entries:
             if len(selected_global) >= budget:
                 break
-            sorted_global, sorted_scores = voxel_candidates[v_idx]
-            n_available = sorted_global.numel()
+            n_available = sorted_indices.numel()
             start = round_idx * max_per_voxel
             end = min(start + max_per_voxel, n_available)
             for pos in range(start, end):
                 if len(selected_global) >= budget:
                     break
-                # 跳过负分数 (NaN/Inf 已被设为 -inf)
-                if sorted_scores[pos].item() <= 0:
-                    break
-                selected_global.append(sorted_global[pos].item())
+                selected_global.append(int(sorted_indices[pos].item()))
                 any_selected_this_round = True
 
         if not any_selected_this_round:

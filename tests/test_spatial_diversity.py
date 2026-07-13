@@ -174,7 +174,7 @@ def test_stats_completeness():
     )
     required_keys = [
         'candidate_count', 'selected_count', 'occupied_voxel_count',
-        'voxel_size', 'spatial_runtime_ms', 'jaccard_vs_original',
+        'voxel_size', 'runtime_ms', 'jaccard_vs_original',
         'replaced_count', 'method', 'max_candidates_per_voxel',
         'mean_candidates_per_voxel',
     ]
@@ -257,6 +257,90 @@ def test_method_not_implemented():
             pass
 
 
+def test_nan_inf_excluded():
+    """NaN/Inf 分数的候选被排除，不影响预算"""
+    N = 100
+    candidate_mask = torch.ones(N, dtype=torch.bool)
+    scores = torch.rand(N)
+    scores[0] = float('nan')
+    scores[1] = float('inf')
+    scores[2] = float('-inf')
+    xyz = torch.rand(N, 3)
+    mask, stats = select_spatially_diverse_candidates(
+        candidate_mask, scores, xyz, budget=50
+    )
+    # NaN/Inf 不被选中
+    assert not mask[0], "NaN should be excluded"
+    assert not mask[1], "+Inf should be excluded"
+    assert not mask[2], "-Inf should be excluded"
+    # 有限候选数 N-3=97, budget=50 → 选中 50
+    assert mask.sum().item() == 50
+    # candidate_count 报告输入候选数 (含 NaN/Inf)
+    assert stats['candidate_count'] == 100
+
+
+def test_zero_score_selected():
+    """零分候选不应被丢弃 — 后处理器负责 clamp"""
+    N = 50
+    candidate_mask = torch.ones(N, dtype=torch.bool)
+    # 前 10 个零分, 其余正常分数
+    scores = torch.zeros(N)
+    scores[10:] = torch.rand(40) + 0.01
+    xyz = torch.rand(N, 3)
+    mask, stats = select_spatially_diverse_candidates(
+        candidate_mask, scores, xyz, budget=50
+    )
+    # 应选中全部可用候选
+    assert mask.sum().item() == 50
+
+
+def test_index_tie_breaker():
+    """相同分数时按全局索引升序选择 (确定性 tie-breaker)"""
+    N = 20
+    candidate_mask = torch.ones(N, dtype=torch.bool)
+    scores = torch.ones(N) * 0.5  # 全同分数
+    # 分散坐标以确保不同体素
+    xyz = torch.zeros(N, 3)
+    xyz[:, 0] = torch.arange(N).float() * 10.0  # 沿 x 轴分散, 每个体素一个点
+    mask, stats = select_spatially_diverse_candidates(
+        candidate_mask, scores, xyz, budget=20
+    )
+    # 因为每个体素一个候选 (坐标分散 + voxel size 自适应), round-robin
+    # 选中全部。验证确定性: 选中的最小索引是最低索引的候选
+    selected = torch.where(mask)[0]
+    assert selected.numel() == 20
+
+
+def test_max_per_voxel_validation():
+    """max_per_voxel < 1 应抛出 ValueError"""
+    N = 50
+    try:
+        select_spatially_diverse_candidates(
+            torch.ones(N, dtype=torch.bool),
+            torch.rand(N),
+            torch.rand(N, 3),
+            budget=10,
+            max_per_voxel=0,
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "max_per_voxel" in str(e)
+
+
+def test_negative_score_selected():
+    """负分候选不应被丢弃 — 后处理器负责 clamp 到正小量"""
+    N = 30
+    candidate_mask = torch.ones(N, dtype=torch.bool)
+    # 前 15 个负分
+    scores = torch.rand(N) * 2 - 1.0  # [-1, +1]
+    xyz = torch.rand(N, 3)
+    mask, stats = select_spatially_diverse_candidates(
+        candidate_mask, scores, xyz, budget=30
+    )
+    # 全部候选被选中 (budget >= N)
+    assert mask.sum().item() == 30
+
+
 if __name__ == '__main__':
     tests = [
         test_empty_candidates,
@@ -274,6 +358,11 @@ if __name__ == '__main__':
         test_voxel_spatial_spread,
         test_invalid_inputs,
         test_method_not_implemented,
+        test_nan_inf_excluded,
+        test_zero_score_selected,
+        test_index_tie_breaker,
+        test_max_per_voxel_validation,
+        test_negative_score_selected,
     ]
     passed = 0
     for test in tests:

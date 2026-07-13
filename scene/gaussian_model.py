@@ -558,24 +558,30 @@ class GaussianModel:
 
             # 确保空间选中的候选具有严格正的 selection_score
             # (LAS 的 torch.multinomial 只对 padded_importance > 0 抽样)
+            # 对全体 spatial_mask 中 score <= 0 或非有限的值 clamp 到安全小量
             if spatial_mask.sum() > 0:
-                score_to_set = selection_score[spatial_mask].clone()
-                score_to_set[score_to_set <= 0] = 1e-6
-                selection_score[spatial_mask] = score_to_set
+                sel_scores = selection_score[spatial_mask]
+                need_clamp = (sel_scores <= 0) | (~torch.isfinite(sel_scores))
+                if need_clamp.any():
+                    sel_scores[need_clamp] = 1e-6
+                    selection_score[spatial_mask] = sel_scores
 
             # 更新统计信息
             self.candidate_stats['spatial_candidate_count'] = spatial_stats['candidate_count']
             self.candidate_stats['spatial_selected_count'] = spatial_stats['selected_count']
             self.candidate_stats['spatial_occupied_voxels'] = spatial_stats['occupied_voxel_count']
             self.candidate_stats['spatial_voxel_size'] = spatial_stats['voxel_size']
-            self.candidate_stats['spatial_runtime_ms'] = spatial_stats['spatial_runtime_ms']
+            self.candidate_stats['spatial_runtime_ms'] = spatial_stats['runtime_ms']
             self.candidate_stats['spatial_jaccard'] = spatial_stats['jaccard_vs_original']
             self.candidate_stats['spatial_replaced'] = spatial_stats['replaced_count']
             self.candidate_stats['spatial_method'] = spatial_stats['method']
 
             # 将空间选择后的掩码替换 final_mask
             final_mask = spatial_mask
-            self.candidate_stats['n_final_candidates'] = int(final_mask.sum().item())
+            # 更新预算相关统计，确保与 LAS 实际输入一致
+            effective_selected = int(final_mask.sum().item())
+            self.candidate_stats['n_final_candidates'] = effective_selected
+            self.candidate_stats['actual_budget'] = effective_selected
 
         if all_budget > 0:
             self.long_axis_split(
