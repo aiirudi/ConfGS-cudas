@@ -124,7 +124,7 @@ class OptimizationParams(ParamGroup):
 
         # Conf parameter
         self.conf_min_views = 3
-        self.conf_thr = 0.8
+        self.conf_thr = 0.9
 
         # ---- 候选点选择策略参数 ----
         # 策略选择: and | or | abs_only | conf_only | weighted_score | soft_fusion | rfas_rank
