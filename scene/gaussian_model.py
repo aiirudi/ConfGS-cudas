@@ -522,6 +522,7 @@ class GaussianModel:
 
         # Conf 候选点可视化 hook: 在 interval 累计统计完成后、Gaussian 数量变化前生成快照和标注图
         # 红点来自完整 densification interval 内的累计 Conf 统计，不是单步瞬时结果
+        # 可视化在空间多样性选择之前运行，以显示原始 final_mask（不受空间选择影响）
         if vis_context is not None:
             from utils.conf_visualization import save_conf_visualization
             save_conf_visualization(
@@ -530,6 +531,51 @@ class GaussianModel:
                 vis_context, opt,
                 abs_mask=abs_mask, abs_score=grad_vars,
             )
+
+        # ---- 空间多样性候选选择器 (后处理模块) ----
+        # 在可视化之后、long_axis_split 之前运行，确保可视化显示原始候选
+        # 默认关闭 (enable_spatial_diversity=False)，不影响原始代码路径
+        if getattr(opt, 'enable_spatial_diversity', False) and all_budget > 0 and iteration <= 14500:
+            from utils.spatial_diversity import select_spatially_diverse_candidates
+
+            # 解析体素尺寸：负值或 None 表示自动计算
+            raw_voxel_size = getattr(opt, 'spatial_voxel_size', -1.0)
+            resolved_voxel_size = None if raw_voxel_size <= 0 else float(raw_voxel_size)
+
+            spatial_mask, spatial_stats = select_spatially_diverse_candidates(
+                candidate_mask=final_mask,
+                priority_scores=selection_score.clone(),
+                xyz=self.get_xyz.detach(),
+                budget=all_budget,
+                method=getattr(opt, 'spatial_diversity_method', 'voxel'),
+                voxel_size=resolved_voxel_size,
+                scales=self.get_scaling.detach(),
+                max_per_voxel=getattr(opt, 'spatial_max_per_voxel', 1),
+                radius_scale=getattr(opt, 'spatial_radius_scale', 1.0),
+                suppression_weight=getattr(opt, 'spatial_suppression_weight', 1.0),
+                voxel_scale=getattr(opt, 'spatial_voxel_scale', 2.0),
+            )
+
+            # 确保空间选中的候选具有严格正的 selection_score
+            # (LAS 的 torch.multinomial 只对 padded_importance > 0 抽样)
+            if spatial_mask.sum() > 0:
+                score_to_set = selection_score[spatial_mask].clone()
+                score_to_set[score_to_set <= 0] = 1e-6
+                selection_score[spatial_mask] = score_to_set
+
+            # 更新统计信息
+            self.candidate_stats['spatial_candidate_count'] = spatial_stats['candidate_count']
+            self.candidate_stats['spatial_selected_count'] = spatial_stats['selected_count']
+            self.candidate_stats['spatial_occupied_voxels'] = spatial_stats['occupied_voxel_count']
+            self.candidate_stats['spatial_voxel_size'] = spatial_stats['voxel_size']
+            self.candidate_stats['spatial_runtime_ms'] = spatial_stats['spatial_runtime_ms']
+            self.candidate_stats['spatial_jaccard'] = spatial_stats['jaccard_vs_original']
+            self.candidate_stats['spatial_replaced'] = spatial_stats['replaced_count']
+            self.candidate_stats['spatial_method'] = spatial_stats['method']
+
+            # 将空间选择后的掩码替换 final_mask
+            final_mask = spatial_mask
+            self.candidate_stats['n_final_candidates'] = int(final_mask.sum().item())
 
         if all_budget > 0:
             self.long_axis_split(

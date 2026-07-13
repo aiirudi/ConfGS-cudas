@@ -341,6 +341,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                                 'sel_score_mean', 'sel_score_std', 'sel_score_median',
                                 'iou_abs_conf', 'overlap_abs', 'overlap_conf',
                                 'n_nan', 'n_inf',
+                                'spatial_candidate_count', 'spatial_selected_count',
+                                'spatial_occupied_voxels', 'spatial_voxel_size',
+                                'spatial_runtime_ms', 'spatial_jaccard', 'spatial_replaced',
+                                'spatial_method',
                             ]
                             write_header = not os.path.exists(stats_path)
                             with open(stats_path, 'a', newline='') as f:

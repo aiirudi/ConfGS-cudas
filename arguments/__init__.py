@@ -162,6 +162,28 @@ class OptimizationParams(ParamGroup):
         self.candidate_rfas_topk = 0
         self.candidate_rfas_topk_ratio = 0.05
 
+        # ---- 空间多样性候选选择器参数 ----
+        # 是否启用空间多样性模块
+        self.enable_spatial_diversity = False
+        # 空间选择方法: voxel | radius_nms | soft_suppression
+        self.spatial_diversity_method = 'voxel'
+        # 体素尺寸: float = 指定值; 'auto' = 自动从 scale 计算
+        self.spatial_voxel_size = -1.0
+        # 自动体素尺寸系数 (voxel_size = scale * median(max_scale))
+        self.spatial_voxel_scale = 2.0
+        # 每轮每体素最多选择候选数
+        self.spatial_max_per_voxel = 1
+        # 预算模式: original | fixed | ratio
+        self.spatial_budget_mode = 'original'
+        # fixed 模式下的目标预算
+        self.spatial_budget = -1
+        # ratio 模式下占候选数的比例
+        self.spatial_budget_ratio = 1.0
+        # Radius NMS 自适应半径系数 (预留)
+        self.spatial_radius_scale = 1.0
+        # Soft suppression 权重 (预留)
+        self.spatial_suppression_weight = 1.0
+
         # Conf 候选点可视化参数
         self.visualize_conf = True
         self.conf_vis_iterations = []
