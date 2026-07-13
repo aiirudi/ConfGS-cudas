@@ -516,7 +516,7 @@ def main():
 
         print(f"\n📈 Performance Assessment:")
         if stable_fps >= 60:
-            rating = "Excellent (60+ FPS)"
+            rating = "Excellent (60+ FPS) ✓"
         elif stable_fps >= 30:
             rating = "Good (30-60 FPS)"
         elif stable_fps >= 15:
