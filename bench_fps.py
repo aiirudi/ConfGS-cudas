@@ -73,6 +73,21 @@ def select_cameras(scene, fps_split, fps_max_views, fps_camera_seed):
     return cameras, fps_split
 
 
+def select_legacy_cameras(scene, args):
+    """Legacy path camera 选择：匹配原始 bench_fps.py 行为。
+
+    test 优先，有 --use_train 时用 train，空则 fallback 到 train，都空则 RuntimeError。
+    """
+    use_train = hasattr(args, 'use_train') and args.use_train
+    views = scene.getTrainCameras() if use_train else scene.getTestCameras()
+    if len(views) == 0:
+        print("No test cameras found, using training cameras...")
+        views = scene.getTrainCameras()
+    if len(views) == 0:
+        raise RuntimeError("No cameras found at all!")
+    return views
+
+
 def render_warmup(cameras, gaussians, pipe, background, render_kwargs, warmup_frames):
     """GPU 预热：循环渲染 warmup_frames 帧，结束后同步。"""
     for i in range(warmup_frames):
@@ -257,6 +272,8 @@ def main():
     parser.add_argument("--iteration", type=int, default=-1)
     parser.add_argument("--num_frames", type=int, default=200,
                         help="Number of frames for per-frame timing mode")
+    parser.add_argument("--use_train", action="store_true",
+                        help="Use training cameras (legacy path only)")
 
     # 新增 FPS benchmark 参数
     parser.add_argument("--benchmark_fps", action="store_true", default=False,
@@ -284,9 +301,6 @@ def main():
     pipe = pp.extract(args)
     opt = op.extract(args)
 
-    # 验证 FPS 参数
-    validate_fps_args(args.fps_warmup, args.fps_repeat, args.fps_max_views)
-
     # 初始化模型
     try:
         gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -297,11 +311,6 @@ def main():
         scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
     except TypeError:
         scene = Scene(dataset, gaussians)
-
-    # 选择相机
-    cameras, split_name = select_cameras(
-        scene, args.fps_split, args.fps_max_views, args.fps_camera_seed
-    )
 
     background = torch.tensor(
         [1.0, 1.0, 1.0] if dataset.white_background else [0.0, 0.0, 0.0],
@@ -319,35 +328,38 @@ def main():
     if "separate_sh" in render_params:
         render_kwargs["separate_sh"] = SPARSE_ADAM_AVAILABLE
 
-    # 场景信息
-    gaussian_count = gaussians.get_xyz.shape[0]
-    img_width = cameras[0].image_width
-    img_height = cameras[0].image_height
     device_name = torch.cuda.get_device_name(0)
     iteration = scene.loaded_iter if scene.loaded_iter else args.iteration
-
-    print(f"\n{'='*80}")
-    print(f"FPS Benchmark Configuration")
-    print(f"{'='*80}")
-    print(f"Scene Path       : {dataset.model_path}")
-    print(f"Iteration        : {iteration}")
-    print(f"Num Gaussians    : {gaussian_count:,}")
-    print(f"Image Resolution : {img_width} x {img_height}")
-    print(f"Available Views  : {len(cameras)} ({split_name})")
-    print(f"Timing Mode      : {args.fps_timing_mode}")
-    print(f"{'='*80}\n")
-
-    # ============================================================
-    # Warmup Phase
-    # ============================================================
-    print(f"Warming up GPU ({args.fps_warmup} frames)...")
-    render_warmup(cameras, gaussians, pipe, background, render_kwargs, args.fps_warmup)
-    print(f"Warmup complete\n")
 
     if args.benchmark_fps:
         # ============================================================
         # Standardized Benchmark Path (--benchmark_fps)
         # ============================================================
+        validate_fps_args(args.fps_warmup, args.fps_repeat, args.fps_max_views)
+
+        cameras, split_name = select_cameras(
+            scene, args.fps_split, args.fps_max_views, args.fps_camera_seed
+        )
+
+        gaussian_count = gaussians.get_xyz.shape[0]
+        img_width = cameras[0].image_width
+        img_height = cameras[0].image_height
+
+        print(f"\n{'='*80}")
+        print(f"FPS Benchmark Configuration")
+        print(f"{'='*80}")
+        print(f"Scene Path       : {dataset.model_path}")
+        print(f"Iteration        : {iteration}")
+        print(f"Num Gaussians    : {gaussian_count:,}")
+        print(f"Image Resolution : {img_width} x {img_height}")
+        print(f"Available Views  : {len(cameras)} ({split_name})")
+        print(f"Timing Mode      : {args.fps_timing_mode}")
+        print(f"{'='*80}\n")
+
+        print(f"Warming up GPU ({args.fps_warmup} frames)...")
+        render_warmup(cameras, gaussians, pipe, background, render_kwargs, args.fps_warmup)
+        print(f"Warmup complete\n")
+
         if args.fps_timing_mode == "batch":
             print(f"Measuring FPS (batch timing, {args.fps_repeat} repeats x {len(cameras)} views)...")
             fps, avg_ms, total_frames, elapsed_seconds = benchmark_batch(
@@ -359,7 +371,6 @@ def main():
                 split_name, args.fps_warmup, len(cameras), args.fps_repeat
             )
         else:
-            # per_frame mode
             num_frames = args.num_frames
             print(f"Measuring FPS (per-frame timing, {num_frames} frames)...")
             stats = benchmark_per_frame(
@@ -371,7 +382,6 @@ def main():
             avg_ms = stats["stable_mean_time"]
             elapsed_seconds = (stats["mean_time"] * num_frames) / 1000.0
 
-            # per-view 分析
             if len(cameras) > 1:
                 print(f"\n  Per-View Analysis (testing all {len(cameras)} views):")
                 view_fps_list = []
@@ -391,7 +401,6 @@ def main():
                     print(f"    View {view_id+1:2d}: {view_fps:6.2f} FPS")
                 print(f"\n    FPS variance across views: ±{np.std(view_fps_list):.2f}\n")
 
-        # JSON Output
         json_path = getattr(args, 'fps_output', None)
         if json_path is None:
             json_path = os.path.join(dataset.model_path, "fps_benchmark.json")
@@ -404,34 +413,162 @@ def main():
 
     else:
         # ============================================================
-        # Legacy Path (no --benchmark_fps): per-frame only, no JSON
+        # Legacy Path (no --benchmark_fps): 完全匹配原始 bench_fps.py 行为
         # ============================================================
-        num_frames = args.num_frames
-        print(f"Measuring FPS (per-frame timing, {num_frames} frames)...")
-        stats = benchmark_per_frame(
-            cameras, gaussians, pipe, background, render_kwargs, num_frames
-        )
-        print_per_frame_result(stats, gaussian_count, device_name, img_width, img_height)
+        views = select_legacy_cameras(scene, args)
 
-        # per-view 分析
-        if len(cameras) > 1:
-            print(f"\n  Per-View Analysis (testing all {len(cameras)} views):")
+        num_gaussians = len(gaussians.get_xyz)
+        img_width = views[0].image_width
+        img_height = views[0].image_height
+
+        print(f"\n{'='*80}")
+        print(f"FPS Benchmark Configuration")
+        print(f"{'='*80}")
+        print(f"Scene Path       : {dataset.model_path}")
+        print(f"Iteration        : {args.iteration}")
+        print(f"Num Gaussians    : {num_gaussians:,}")
+        print(f"Image Resolution : {img_width} x {img_height}")
+        print(f"Num Views        : {len(views)}")
+        print(f"Test Frames      : {args.num_frames}")
+        print(f"{'='*80}\n")
+
+        # 原始 warmup
+        print("Phase 1: Warming up GPU...")
+        warmup_frames = min(50, args.num_frames // 4)
+        test_view = views[0]
+
+        for i in range(warmup_frames):
+            _ = render(test_view, gaussians, pipe, background, **render_kwargs)["render"]
+            if (i + 1) % 10 == 0:
+                print(f"  Warmup progress: {i+1}/{warmup_frames}")
+
+        torch.cuda.synchronize()
+        print(f"  Warmup complete ({warmup_frames} frames)\n")
+
+        # 原始 per-frame timing
+        print("Phase 2: Measuring frame-by-frame rendering time...")
+
+        frame_times_ms = []
+        view_idx = 0
+
+        for i in range(args.num_frames):
+            current_view = views[view_idx % len(views)]
+            view_idx += 1
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
+            _ = render(current_view, gaussians, pipe, background, **render_kwargs)["render"]
+            end_event.record()
+
+            torch.cuda.synchronize()
+            frame_times_ms.append(start_event.elapsed_time(end_event))
+
+            if (i + 1) % 50 == 0:
+                print(f"  Progress: {i+1}/{args.num_frames} frames")
+
+        print(f"  Rendered {args.num_frames} frames\n")
+
+        # 原始统计分析
+        frame_times_ms = np.array(frame_times_ms)
+
+        mean_time = np.mean(frame_times_ms)
+        median_time = np.median(frame_times_ms)
+        std_time = np.std(frame_times_ms)
+        min_time = np.min(frame_times_ms)
+        max_time = np.max(frame_times_ms)
+
+        fps_values = 1000.0 / frame_times_ms
+        mean_fps = 1000.0 / mean_time
+        median_fps = 1000.0 / median_time
+        min_fps = 1000.0 / max_time
+        max_fps = 1000.0 / min_time
+
+        p5_time = np.percentile(frame_times_ms, 5)
+        p95_time = np.percentile(frame_times_ms, 95)
+        p5_fps = 1000.0 / p95_time
+        p95_fps = 1000.0 / p5_time
+
+        trimmed_times = frame_times_ms[(frame_times_ms >= p5_time) & (frame_times_ms <= p95_time)]
+        stable_mean_time = np.mean(trimmed_times)
+        stable_fps = 1000.0 / stable_mean_time
+
+        # 原始结果输出
+        print(f"{'='*80}")
+        print(f"FPS Benchmark Results")
+        print(f"{'='*80}")
+        print(f"\n  Frame Timing Statistics:")
+        print(f"  Mean frame time    : {mean_time:.3f} ms")
+        print(f"  Median frame time  : {median_time:.3f} ms")
+        print(f"  Std deviation      : {std_time:.3f} ms")
+        print(f"  Min frame time     : {min_time:.3f} ms")
+        print(f"  Max frame time     : {max_time:.3f} ms")
+        print(f"  5th percentile     : {p5_time:.3f} ms")
+        print(f"  95th percentile    : {p95_time:.3f} ms")
+
+        print(f"\n  FPS Metrics:")
+        print(f"  Mean FPS           : {mean_fps:.2f}")
+        print(f"  Median FPS         : {median_fps:.2f}")
+        print(f"  Stable FPS (5-95%) : {stable_fps:.2f}")
+        print(f"  Min FPS            : {min_fps:.2f}")
+        print(f"  Max FPS            : {max_fps:.2f}")
+
+        print(f"\n  Performance Assessment:")
+        if stable_fps >= 60:
+            rating = "Excellent (60+ FPS)"
+        elif stable_fps >= 30:
+            rating = "Good (30-60 FPS)"
+        elif stable_fps >= 15:
+            rating = "Fair (15-30 FPS)"
+        else:
+            rating = "Poor (<15 FPS)"
+        print(f"  Rating: {rating}")
+
+        print(f"\n  Scene Complexity:")
+        print(f"  Gaussians          : {num_gaussians:,}")
+        print(f"  Resolution         : {img_width} x {img_height}")
+        print(f"  Megapixels         : {(img_width * img_height) / 1e6:.2f} MP")
+        print(f"  Gaussians/Megapixel: {num_gaussians / ((img_width * img_height) / 1e6):.0f}")
+
+        print(f"\n{'='*80}")
+        print(f"  SUMMARY (Copy this for your paper/report):")
+        print(f"{'='*80}")
+        print(f"Scene: {dataset.model_path.split('/')[-1]}")
+        print(f"FPS: {stable_fps:.2f} (stable), {mean_fps:.2f} (mean)")
+        print(f"Frame Time: {stable_mean_time:.2f}ms (stable), {mean_time:.2f}ms (mean)")
+        print(f"Resolution: {img_width}x{img_height}, Gaussians: {num_gaussians:,}")
+        print(f"{'='*80}\n")
+
+        # 原始 per-view 分析
+        if len(views) > 1:
+            print(f"\n  Per-View Analysis (testing all {len(views)} views):")
             view_fps_list = []
-            for view_id, view in enumerate(cameras):
+
+            for view_id, view in enumerate(views):
                 view_times = []
-                test_count = min(20, num_frames // len(cameras))
+                test_count = min(20, args.num_frames // len(views))
+
                 for _ in range(test_count):
-                    se = torch.cuda.Event(enable_timing=True)
-                    ee = torch.cuda.Event(enable_timing=True)
-                    se.record()
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
+                    start_event.record()
                     _ = render(view, gaussians, pipe, background, **render_kwargs)["render"]
-                    ee.record()
+                    end_event.record()
+
                     torch.cuda.synchronize()
-                    view_times.append(se.elapsed_time(ee))
-                view_fps = 1000.0 / np.mean(view_times)
+                    view_times.append(start_event.elapsed_time(end_event))
+
+                view_mean_time = np.mean(view_times)
+                view_fps = 1000.0 / view_mean_time
                 view_fps_list.append(view_fps)
-                print(f"    View {view_id+1:2d}: {view_fps:6.2f} FPS")
-            print(f"\n    FPS variance across views: ±{np.std(view_fps_list):.2f}\n")
+
+                print(f"  View {view_id+1:2d}: {view_fps:6.2f} FPS ({view_mean_time:6.2f}ms)")
+
+            fps_variance = np.std(view_fps_list)
+            print(f"\n  FPS variance across views: ±{fps_variance:.2f}")
+            print(f"  Most consistent view would get: {np.median(view_fps_list):.2f} FPS\n")
 
 
 if __name__ == "__main__":

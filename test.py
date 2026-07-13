@@ -69,9 +69,9 @@ for data, group, budget in paramList:
 
     # 4. FPS benchmark (pure rendering speed, not including image save/metrics/Conf)
     fps_json_path = os.path.join(out, 'fps_benchmark.json')
-    # 删除可能存在的过期 fps_benchmark.json，确保使用最新结果
     if os.path.exists(fps_json_path):
         os.remove(fps_json_path)
+    fps_ok = False
     try:
         subprocess.run(
             ['python', 'bench_fps.py', '-m', out, '--benchmark_fps', '--fps_timing_mode', 'batch'],
@@ -79,15 +79,16 @@ for data, group, budget in paramList:
             capture_output=True,
             text=True
         )
+        fps_ok = True
     except subprocess.CalledProcessError as e:
         print(f"  [WARN] bench_fps.py failed with code {e.returncode}: {e.stderr[:200] if e.stderr else ''}")
-    if os.path.exists(fps_json_path):
+    if fps_ok and os.path.exists(fps_json_path):
         with open(fps_json_path, 'r') as fp:
             fps_data = json.load(fp)
         scene_metrics['fps'] = fps_data.get('fps', 0.0)
         scene_metrics['fps_latency_ms'] = fps_data.get('average_ms_per_frame', 0.0)
-    else:
-        print(f"  [WARN] {out}/fps_benchmark.json not found — did bench_fps.py run?")
+    elif not fps_ok:
+        print(f"  [WARN] Skipping FPS collection due to bench_fps.py failure")
 
     # 1. Training PSNR (from evaluation at iteration 30000)
     # 2. Component times (from profiler)
