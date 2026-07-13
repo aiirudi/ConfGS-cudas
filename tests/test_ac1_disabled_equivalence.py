@@ -152,11 +152,7 @@ def test_disabled_path_equivalence():
                     opt=opt, iteration=600, limitation=1300000,
                 )
 
-    # 验证 import blocker 未被触发 (spatial_diversity 未导入)
-    assert not blocker._mock_side_effect_raises or len(las_args) > 0, \
-        "spatial_diversity import should be blocked"
-
-    # 验证 LAS 被调用
+    # 验证 LAS 被调用 (import blocker 已验证: 若有 blocked import 会抛出异常)
     assert len(las_args) == 1, f"LAS should be called once, got {len(las_args)}"
     las_sel, las_budget, las_mask = las_args[0]
 
@@ -164,9 +160,13 @@ def test_disabled_path_equivalence():
     assert las_budget == all_budget, \
         f"LAS budget {las_budget} != expected {all_budget}"
 
-    # 验证 final_mask 等价 (LAS 收到的 mask 应等于 selector 输出)
+    # 验证 final_mask 等价
     assert torch.equal(las_mask, expected_mask), \
         "Disabled path: LAS mask must equal selector output"
+
+    # 验证 selection_score 等价
+    assert torch.equal(las_sel, expected_selection), \
+        "Disabled path: LAS selection_score must equal selector output"
 
     # 验证候选统计无 spatial_* 键
     spatial_keys = [k for k in gs.candidate_stats if k.startswith('spatial_')]

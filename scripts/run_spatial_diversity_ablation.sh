@@ -61,6 +61,7 @@ for SCENE in ${SCENES}; do
         --eval \
         --seed "${SEED}" \
         --data_device cpu \
+        --iterations "${ITERATIONS}" \
         --candidate_selection_strategy "${CANDIDATE_STRATEGY}" || {
         echo "ERROR: baseline training failed for ${SCENE}"
         continue
@@ -82,6 +83,7 @@ for SCENE in ${SCENES}; do
         --eval \
         --seed "${SEED}" \
         --data_device cpu \
+        --iterations "${ITERATIONS}" \
         --candidate_selection_strategy "${CANDIDATE_STRATEGY}" \
         --enable_spatial_diversity \
         --spatial_diversity_method voxel \
@@ -101,39 +103,38 @@ for SCENE in ${SCENES}; do
     echo "  Collecting aggregate metrics..."
 
     # 从 results.json 提取 PSNR/SSIM/LPIPS
-    BASELINE_PSNR=$(python3 -c "import json; d=json.load(open('${BASELINE_JSON}')); print(d.get('PSNR', 'N/A'))" 2>/dev/null || echo "N/A")
-    SPATIAL_PSNR=$(python3 -c "import json; d=json.load(open('${SPATIAL_JSON}')); print(d.get('PSNR', 'N/A'))" 2>/dev/null || echo "N/A")
+    _extract_metric() {
+        python3 -c "import json; d=json.load(open('${1}')); print(d.get('${2}', 'N/A'))" 2>/dev/null || echo "N/A"
+    }
+    BASELINE_PSNR=$(_extract_metric "${BASELINE_JSON}" "PSNR")
+    BASELINE_SSIM=$(_extract_metric "${BASELINE_JSON}" "SSIM")
+    BASELINE_LPIPS=$(_extract_metric "${BASELINE_JSON}" "LPIPS")
+    SPATIAL_PSNR=$(_extract_metric "${SPATIAL_JSON}" "PSNR")
+    SPATIAL_SSIM=$(_extract_metric "${SPATIAL_JSON}" "SSIM")
+    SPATIAL_LPIPS=$(_extract_metric "${SPATIAL_JSON}" "LPIPS")
 
     # 从 candidate_selection_stats.csv 提取空间统计
-    BASELINE_CSV="${BASELINE_DIR}/candidate_selection_stats.csv"
     SPATIAL_CSV="${SPATIAL_DIR}/candidate_selection_stats.csv"
 
-    SPATIAL_RUNTIME_MEAN="N/A"
-    SPATIAL_SELECTED_MEAN="N/A"
-    SPATIAL_OCCUPIED_MEAN="N/A"
-    if [ -f "${SPATIAL_CSV}" ]; then
-        SPATIAL_RUNTIME_MEAN=$(python3 -c "
+    _csv_mean() {
+        if [ ! -f "${SPATIAL_CSV}" ]; then echo "N/A"; return; fi
+        python3 -c "
 import csv
 with open('${SPATIAL_CSV}') as f:
-    rows = [r for r in csv.DictReader(f) if r.get('spatial_runtime_ms','').strip()]
-vals = [float(r['spatial_runtime_ms']) for r in rows]
+    rows = [r for r in csv.DictReader(f) if r.get('${1}','').strip()]
+vals = [float(r['${1}']) for r in rows]
 print(f'{sum(vals)/len(vals):.1f}' if vals else 'N/A')
-" 2>/dev/null || echo "N/A")
-        SPATIAL_SELECTED_MEAN=$(python3 -c "
-import csv
-with open('${SPATIAL_CSV}') as f:
-    rows = [r for r in csv.DictReader(f) if r.get('spatial_selected_count','').strip()]
-vals = [float(r['spatial_selected_count']) for r in rows]
-print(f'{sum(vals)/len(vals):.1f}' if vals else 'N/A')
-" 2>/dev/null || echo "N/A")
-        SPATIAL_OCCUPIED_MEAN=$(python3 -c "
-import csv
-with open('${SPATIAL_CSV}') as f:
-    rows = [r for r in csv.DictReader(f) if r.get('spatial_occupied_voxels','').strip()]
-vals = [float(r['spatial_occupied_voxels']) for r in rows]
-print(f'{sum(vals)/len(vals):.1f}' if vals else 'N/A')
-" 2>/dev/null || echo "N/A")
-    fi
+" 2>/dev/null || echo "N/A"
+    }
+    SPATIAL_RUNTIME_MEAN=$(_csv_mean "spatial_runtime_ms")
+    SPATIAL_SELECTED_MEAN=$(_csv_mean "spatial_selected_count")
+    SPATIAL_OCCUPIED_MEAN=$(_csv_mean "spatial_occupied_voxels")
+    SPATIAL_JACCARD_MEAN=$(_csv_mean "spatial_jaccard")
+    SPATIAL_REPLACED_MEAN=$(_csv_mean "spatial_replaced")
+
+    # 最终 Gaussian 数量 (从 ply 文件推断或从 CSV)
+    FINAL_GS_BASELINE=$(ls "${BASELINE_DIR}/point_cloud/iteration_${ITERATIONS}/point_cloud.ply" 2>/dev/null && echo "see_ply" || echo "N/A")
+    FINAL_GS_SPATIAL=$(ls "${SPATIAL_DIR}/point_cloud/iteration_${ITERATIONS}/point_cloud.ply" 2>/dev/null && echo "see_ply" || echo "N/A")
 
     # 写入汇总 JSON
     if [ "${FIRST_SCENE}" = false ]; then
@@ -144,14 +145,20 @@ print(f'{sum(vals)/len(vals):.1f}' if vals else 'N/A')
     "${SCENE}": {
       "baseline": {
         "psnr": "${BASELINE_PSNR}",
+        "ssim": "${BASELINE_SSIM}",
+        "lpips": "${BASELINE_LPIPS}",
         "spatial_enabled": false
       },
       "spatial_voxel": {
         "psnr": "${SPATIAL_PSNR}",
+        "ssim": "${SPATIAL_SSIM}",
+        "lpips": "${SPATIAL_LPIPS}",
         "spatial_enabled": true,
         "mean_spatial_runtime_ms": "${SPATIAL_RUNTIME_MEAN}",
         "mean_spatial_selected_count": "${SPATIAL_SELECTED_MEAN}",
-        "mean_spatial_occupied_voxels": "${SPATIAL_OCCUPIED_MEAN}"
+        "mean_spatial_occupied_voxels": "${SPATIAL_OCCUPIED_MEAN}",
+        "mean_spatial_jaccard": "${SPATIAL_JACCARD_MEAN}",
+        "mean_spatial_replaced": "${SPATIAL_REPLACED_MEAN}"
       }
     }
 EOF
