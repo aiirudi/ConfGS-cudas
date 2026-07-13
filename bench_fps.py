@@ -26,10 +26,12 @@ def positive_int(value):
 
 
 def non_zero_int_or_neg1(value):
-    """argparse type: 非零整数或 -1（表全部）。"""
+    """argparse type: -1（表全部）或正整数（≥1）。"""
     ival = int(value)
     if ival == 0:
         raise ValueError("fps_max_views cannot be 0 (use -1 for all)")
+    if ival < -1:
+        raise ValueError(f"fps_max_views must be -1 or >= 1, got {ival}")
     return ival
 
 
@@ -257,9 +259,8 @@ def main():
                         help="Number of frames for per-frame timing mode")
 
     # 新增 FPS benchmark 参数
-    parser.add_argument("--benchmark_fps", type=lambda x: x.lower() == 'true',
-                        default=True,
-                        help="Enable FPS benchmark (default: true). Set to false for legacy no-JSON mode.")
+    parser.add_argument("--benchmark_fps", action="store_true", default=False,
+                        help="Enable standardized FPS benchmark with JSON output")
     parser.add_argument("--fps_split", type=str, default="test",
                         choices=["train", "test"],
                         help="Camera split for FPS benchmark (default: test)")
@@ -343,21 +344,68 @@ def main():
     render_warmup(cameras, gaussians, pipe, background, render_kwargs, args.fps_warmup)
     print(f"Warmup complete\n")
 
-    # ============================================================
-    # FPS Measurement
-    # ============================================================
-    if args.fps_timing_mode == "batch":
-        print(f"Measuring FPS (batch timing, {args.fps_repeat} repeats x {len(cameras)} views)...")
-        fps, avg_ms, total_frames, elapsed_seconds = benchmark_batch(
-            cameras, gaussians, pipe, background, render_kwargs, args.fps_repeat
-        )
-        print_batch_result(
-            fps, avg_ms, total_frames, elapsed_seconds,
+    if args.benchmark_fps:
+        # ============================================================
+        # Standardized Benchmark Path (--benchmark_fps)
+        # ============================================================
+        if args.fps_timing_mode == "batch":
+            print(f"Measuring FPS (batch timing, {args.fps_repeat} repeats x {len(cameras)} views)...")
+            fps, avg_ms, total_frames, elapsed_seconds = benchmark_batch(
+                cameras, gaussians, pipe, background, render_kwargs, args.fps_repeat
+            )
+            print_batch_result(
+                fps, avg_ms, total_frames, elapsed_seconds,
+                gaussian_count, device_name, img_width, img_height,
+                split_name, args.fps_warmup, len(cameras), args.fps_repeat
+            )
+        else:
+            # per_frame mode
+            num_frames = args.num_frames
+            print(f"Measuring FPS (per-frame timing, {num_frames} frames)...")
+            stats = benchmark_per_frame(
+                cameras, gaussians, pipe, background, render_kwargs, num_frames
+            )
+            print_per_frame_result(stats, gaussian_count, device_name, img_width, img_height)
+            total_frames = num_frames
+            fps = stats["stable_fps"]
+            avg_ms = stats["stable_mean_time"]
+            elapsed_seconds = (stats["mean_time"] * num_frames) / 1000.0
+
+            # per-view 分析
+            if len(cameras) > 1:
+                print(f"\n  Per-View Analysis (testing all {len(cameras)} views):")
+                view_fps_list = []
+                for view_id, view in enumerate(cameras):
+                    view_times = []
+                    test_count = min(20, num_frames // len(cameras))
+                    for _ in range(test_count):
+                        se = torch.cuda.Event(enable_timing=True)
+                        ee = torch.cuda.Event(enable_timing=True)
+                        se.record()
+                        _ = render(view, gaussians, pipe, background, **render_kwargs)["render"]
+                        ee.record()
+                        torch.cuda.synchronize()
+                        view_times.append(se.elapsed_time(ee))
+                    view_fps = 1000.0 / np.mean(view_times)
+                    view_fps_list.append(view_fps)
+                    print(f"    View {view_id+1:2d}: {view_fps:6.2f} FPS")
+                print(f"\n    FPS variance across views: ±{np.std(view_fps_list):.2f}\n")
+
+        # JSON Output
+        json_path = args.fps_output
+        if json_path is None:
+            json_path = os.path.join(dataset.model_path, "fps_benchmark.json")
+        save_fps_json(
+            json_path, split_name, iteration, args.fps_warmup, args.fps_repeat,
+            len(cameras), total_frames, elapsed_seconds, avg_ms, fps,
             gaussian_count, device_name, img_width, img_height,
-            split_name, args.fps_warmup, len(cameras), args.fps_repeat
+            args.fps_timing_mode
         )
+
     else:
-        # per_frame mode (保留原有行为)
+        # ============================================================
+        # Legacy Path (no --benchmark_fps): per-frame only, no JSON
+        # ============================================================
         num_frames = args.num_frames
         print(f"Measuring FPS (per-frame timing, {num_frames} frames)...")
         stats = benchmark_per_frame(
@@ -365,13 +413,7 @@ def main():
         )
         print_per_frame_result(stats, gaussian_count, device_name, img_width, img_height)
 
-        # 为 JSON 输出计算 batch-equivalent 指标
-        total_frames = num_frames
-        fps = stats["stable_fps"]
-        avg_ms = stats["stable_mean_time"]
-        elapsed_seconds = (stats["mean_time"] * num_frames) / 1000.0
-
-        # 原有 per-view 分析
+        # per-view 分析
         if len(cameras) > 1:
             print(f"\n  Per-View Analysis (testing all {len(cameras)} views):")
             view_fps_list = []
@@ -390,22 +432,6 @@ def main():
                 view_fps_list.append(view_fps)
                 print(f"    View {view_id+1:2d}: {view_fps:6.2f} FPS")
             print(f"\n    FPS variance across views: ±{np.std(view_fps_list):.2f}\n")
-
-    # ============================================================
-    # JSON Output (仅在 --benchmark_fps 开启时写入)
-    # ============================================================
-    if args.benchmark_fps:
-        json_path = args.fps_output
-        if json_path is None:
-            json_path = os.path.join(dataset.model_path, "fps_benchmark.json")
-        save_fps_json(
-            json_path, split_name, iteration, args.fps_warmup, args.fps_repeat,
-            len(cameras), total_frames, elapsed_seconds, avg_ms, fps,
-            gaussian_count, device_name, img_width, img_height,
-            args.fps_timing_mode
-        )
-    else:
-        print(f"  (--benchmark_fps=false: skipping JSON output)")
 
 
 if __name__ == "__main__":

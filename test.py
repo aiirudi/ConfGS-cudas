@@ -74,7 +74,7 @@ for data, group, budget in paramList:
         os.remove(fps_json_path)
     try:
         subprocess.run(
-            ['python', 'bench_fps.py', '-m', out, '--fps_timing_mode', 'batch'],
+            ['python', 'bench_fps.py', '-m', out, '--benchmark_fps', '--fps_timing_mode', 'batch'],
             check=True,
             capture_output=True,
             text=True
