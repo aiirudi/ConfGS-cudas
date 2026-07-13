@@ -25,7 +25,7 @@ if [ ${#SCENES[@]} -eq 0 ]; then
     SCENES=(garden)
 fi
 
-ALPHA="0.5"
+ALPHA="0.8"
 DATA_ROOT="/workspace/dataset"
 OUTPUT_BASE="output/candidate_ablation"
 

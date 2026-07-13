@@ -139,13 +139,13 @@ class OptimizationParams(ParamGroup):
         self.candidate_fixed_ratio = 0.05
 
         # weighted_score / soft_fusion 融合权重 alpha
-        self.candidate_weight_alpha = 0.5
+        self.candidate_weight_alpha = 0.8
         # 归一化方式: minmax | zscore | percentile
         self.candidate_score_normalization = 'percentile'
         # 连续分数的选择方式: threshold | topk
         self.candidate_score_selection = 'threshold'
         # threshold 模式的阈值
-        self.candidate_score_threshold = 0.5
+        self.candidate_score_threshold = 0.95
         # topk 模式的绝对数量 (0 = 使用 ratio)
         self.candidate_topk = 0
         # topk 模式的比例 (candidate_topk > 0 时优先使用 absolute)
