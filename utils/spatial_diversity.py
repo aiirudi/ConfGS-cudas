@@ -213,6 +213,7 @@ def _compute_adaptive_voxel_size(
     return voxel_scale * median_scale
 
 
+@torch.no_grad()
 def _voxel_diversity_select(
     cand_indices: torch.Tensor,
     priority_scores: torch.Tensor,

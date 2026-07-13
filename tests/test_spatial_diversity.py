@@ -295,20 +295,51 @@ def test_zero_score_selected():
 
 
 def test_index_tie_breaker():
-    """相同分数时按全局索引升序选择 (确定性 tie-breaker)"""
+    """AC-5: 相同分数时按全局索引升序选择 (确定性 tie-breaker)
+
+    将所有候选放在同一体素内，分数相同，预算小于候选数。
+    验证选中的是最低全局索引的候选。
+    """
     N = 20
     candidate_mask = torch.ones(N, dtype=torch.bool)
     scores = torch.ones(N) * 0.5  # 全同分数
-    # 分散坐标以确保不同体素
+    # 所有候选在同一位置 → 同一体素
     xyz = torch.zeros(N, 3)
-    xyz[:, 0] = torch.arange(N).float() * 10.0  # 沿 x 轴分散, 每个体素一个点
+    budget = 5
     mask, stats = select_spatially_diverse_candidates(
-        candidate_mask, scores, xyz, budget=20
+        candidate_mask, scores.clone(), xyz, budget=budget,
+        voxel_size=1.0,  # 固定体素尺寸确保单一体素
     )
-    # 因为每个体素一个候选 (坐标分散 + voxel size 自适应), round-robin
-    # 选中全部。验证确定性: 选中的最小索引是最低索引的候选
+    # 同一体素内分数相同 → 按全局索引升序选择
     selected = torch.where(mask)[0]
-    assert selected.numel() == 20
+    assert selected.numel() == budget
+    expected = torch.arange(budget)
+    assert torch.equal(selected, expected), \
+        f"Expected indices {expected.tolist()}, got {selected.tolist()}"
+
+
+def test_voxel_traversal_deterministic():
+    """AC-5: 多体素相等 top-score 时的确定性体素遍历顺序"""
+    N = 30
+    candidate_mask = torch.ones(N, dtype=torch.bool)
+    scores = torch.ones(N) * 0.5  # 全同分数
+    # 3 个空间簇，每个 10 个点
+    xyz = torch.zeros(N, 3)
+    xyz[0:10, 0] = 0.0   # voxel A
+    xyz[10:20, 0] = 5.0  # voxel B
+    xyz[20:30, 0] = 10.0 # voxel C
+    mask1, _ = select_spatially_diverse_candidates(
+        candidate_mask, scores.clone(), xyz, budget=6,
+        voxel_size=1.0, max_per_voxel=2,
+    )
+    mask2, _ = select_spatially_diverse_candidates(
+        candidate_mask, scores.clone(), xyz, budget=6,
+        voxel_size=1.0, max_per_voxel=2,
+    )
+    # 确定性：相同输入产生相同输出
+    assert torch.equal(mask1, mask2), "Multi-voxel tie-breaking must be deterministic"
+    # round-robin, max_per_voxel=2: 每个体素选 2 个，3 个体素共 6
+    assert mask1.sum().item() == 6
 
 
 def test_max_per_voxel_validation():
@@ -361,6 +392,7 @@ if __name__ == '__main__':
         test_nan_inf_excluded,
         test_zero_score_selected,
         test_index_tie_breaker,
+        test_voxel_traversal_deterministic,
         test_max_per_voxel_validation,
         test_negative_score_selected,
     ]
