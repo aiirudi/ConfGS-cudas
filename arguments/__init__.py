@@ -167,8 +167,8 @@ class OptimizationParams(ParamGroup):
         self.enable_spatial_diversity = False
         # 空间选择方法: voxel | radius_nms | soft_suppression
         self.spatial_diversity_method = 'voxel'
-        # 体素尺寸: float = 指定值; 'auto' = 自动从 scale 计算
-        self.spatial_voxel_size = -1.0
+        # 体素尺寸: 'auto' = 自动从 scale 计算; 数值字符串如 '0.5' 也可
+        self.spatial_voxel_size = 'auto'
         # 自动体素尺寸系数 (voxel_size = scale * median(max_scale))
         self.spatial_voxel_scale = 2.0
         # 每轮每体素最多选择候选数

@@ -538,9 +538,16 @@ class GaussianModel:
         if getattr(opt, 'enable_spatial_diversity', False) and all_budget > 0 and iteration <= 14500:
             from utils.spatial_diversity import select_spatially_diverse_candidates
 
-            # 解析体素尺寸：负值或 None 表示自动计算
-            raw_voxel_size = getattr(opt, 'spatial_voxel_size', -1.0)
-            resolved_voxel_size = None if raw_voxel_size <= 0 else float(raw_voxel_size)
+            # 解析体素尺寸: 'auto' 或非正数 → 自适应; 正数 → 固定值
+            raw_voxel_size = getattr(opt, 'spatial_voxel_size', 'auto')
+            if isinstance(raw_voxel_size, str) and raw_voxel_size == 'auto':
+                resolved_voxel_size = None
+            else:
+                try:
+                    val = float(raw_voxel_size)
+                    resolved_voxel_size = val if val > 0 else None
+                except (ValueError, TypeError):
+                    resolved_voxel_size = None
 
             spatial_mask, spatial_stats = select_spatially_diverse_candidates(
                 candidate_mask=final_mask,
