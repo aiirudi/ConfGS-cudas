@@ -17,6 +17,22 @@ except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
 
+def positive_int(value):
+    """argparse type: 正整数（≥1）。"""
+    ival = int(value)
+    if ival < 1:
+        raise ValueError(f"must be >= 1, got {ival}")
+    return ival
+
+
+def non_zero_int_or_neg1(value):
+    """argparse type: 非零整数或 -1（表全部）。"""
+    ival = int(value)
+    if ival == 0:
+        raise ValueError("fps_max_views cannot be 0 (use -1 for all)")
+    return ival
+
+
 def validate_fps_args(warmup, repeat, max_views):
     """验证 FPS benchmark 参数合法性，不合法时抛出 ValueError。"""
     if not torch.cuda.is_available():
@@ -241,22 +257,25 @@ def main():
                         help="Number of frames for per-frame timing mode")
 
     # 新增 FPS benchmark 参数
+    parser.add_argument("--benchmark_fps", type=lambda x: x.lower() == 'true',
+                        default=True,
+                        help="Enable FPS benchmark (default: true). Set to false for legacy no-JSON mode.")
     parser.add_argument("--fps_split", type=str, default="test",
                         choices=["train", "test"],
                         help="Camera split for FPS benchmark (default: test)")
     parser.add_argument("--fps_warmup", type=int, default=20,
                         help="Warmup frames before timed measurement (default: 20)")
-    parser.add_argument("--fps_repeat", type=int, default=3,
-                        help="Number of times to repeat full camera set (default: 3)")
-    parser.add_argument("--fps_max_views", type=int, default=-1,
-                        help="Max camera views (-1 = all, default: -1)")
+    parser.add_argument("--fps_repeat", type=positive_int, default=3,
+                        help="Number of times to repeat full camera set (default: 3, min: 1)")
+    parser.add_argument("--fps_max_views", type=non_zero_int_or_neg1, default=-1,
+                        help="Max camera views (-1 = all, must be != 0, default: -1)")
     parser.add_argument("--fps_camera_seed", type=int, default=0,
                         help="Random seed for camera sampling (default: 0)")
     parser.add_argument("--fps_output", type=str, default=None,
                         help="FPS JSON output path (default: <model_path>/fps_benchmark.json)")
-    parser.add_argument("--fps_timing_mode", type=str, default="per_frame",
+    parser.add_argument("--fps_timing_mode", type=str, default="batch",
                         choices=["batch", "per_frame"],
-                        help="Timing mode: batch (paper FPS) or per_frame (detailed stats)")
+                        help="Timing mode: batch (paper FPS, default) or per_frame (detailed stats)")
 
     args = get_combined_args(parser)
 
@@ -373,17 +392,20 @@ def main():
             print(f"\n    FPS variance across views: ±{np.std(view_fps_list):.2f}\n")
 
     # ============================================================
-    # JSON Output (计时结束后写入)
+    # JSON Output (仅在 --benchmark_fps 开启时写入)
     # ============================================================
-    json_path = args.fps_output
-    if json_path is None:
-        json_path = os.path.join(dataset.model_path, "fps_benchmark.json")
-    save_fps_json(
-        json_path, split_name, iteration, args.fps_warmup, args.fps_repeat,
-        len(cameras), total_frames, elapsed_seconds, avg_ms, fps,
-        gaussian_count, device_name, img_width, img_height,
-        args.fps_timing_mode
-    )
+    if args.benchmark_fps:
+        json_path = args.fps_output
+        if json_path is None:
+            json_path = os.path.join(dataset.model_path, "fps_benchmark.json")
+        save_fps_json(
+            json_path, split_name, iteration, args.fps_warmup, args.fps_repeat,
+            len(cameras), total_frames, elapsed_seconds, avg_ms, fps,
+            gaussian_count, device_name, img_width, img_height,
+            args.fps_timing_mode
+        )
+    else:
+        print(f"  (--benchmark_fps=false: skipping JSON output)")
 
 
 if __name__ == "__main__":

@@ -63,15 +63,24 @@ for data, group, budget in paramList:
     os.system(f'python render.py -m {out}')
     os.system(f'python metrics.py -m {out}')
 
+    # 初始化 scene_metrics（必须在所有 JSON 读取之前）
+    scene_metrics = {}
+    scene_metrics['train_time'] = train_time_str
+
     # 4. FPS benchmark (pure rendering speed, not including image save/metrics/Conf)
     fps_json_path = os.path.join(out, 'fps_benchmark.json')
     # 删除可能存在的过期 fps_benchmark.json，确保使用最新结果
     if os.path.exists(fps_json_path):
         os.remove(fps_json_path)
-    fps_cmd = f'python bench_fps.py -m {out} --fps_timing_mode batch'
-    result = subprocess.run(fps_cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  [WARN] bench_fps.py failed with code {result.returncode}: {result.stderr[:200]}")
+    try:
+        subprocess.run(
+            ['python', 'bench_fps.py', '-m', out, '--fps_timing_mode', 'batch'],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"  [WARN] bench_fps.py failed with code {e.returncode}: {e.stderr[:200] if e.stderr else ''}")
     if os.path.exists(fps_json_path):
         with open(fps_json_path, 'r') as fp:
             fps_data = json.load(fp)
@@ -79,10 +88,6 @@ for data, group, budget in paramList:
         scene_metrics['fps_latency_ms'] = fps_data.get('average_ms_per_frame', 0.0)
     else:
         print(f"  [WARN] {out}/fps_benchmark.json not found — did bench_fps.py run?")
-
-    # Collect metrics for this scene
-    scene_metrics = {}
-    scene_metrics['train_time'] = train_time_str
 
     # 1. Training PSNR (from evaluation at iteration 30000)
     # 2. Component times (from profiler)
