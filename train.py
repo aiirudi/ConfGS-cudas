@@ -249,6 +249,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         mode='weighted'
                     )
 
+                    # Stop fusion timer right after fuse_importance_scores()
+                    if opt.profile_components:
+                        end_fusion.record()
+                        torch.cuda.synchronize()
+                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
+                        stage_counts['fusion'] += 1
+                        stage_memory['fusion'] += (torch.cuda.max_memory_allocated() - mem_before_fusion)
+
                     #tt_importance = gaussian_importance_rf # 只启用 rfas
 
                     startI = opt.densify_from_iter
@@ -354,15 +362,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                                 tb_writer.add_scalar('candidate/score_std', stats.get('sel_score_std', 0), iteration)
                                 tb_writer.add_scalar('candidate/overlap_iou', stats.get('iou_abs_conf', 0), iteration)
 
-                    # Stop fusion timer AFTER fused-score consumption (densify_and_prune_Improved)
-                    if opt.profile_components:
-                        end_fusion.record()
-                        torch.cuda.synchronize()
-                        stage_times['fusion'] += start_fusion.elapsed_time(end_fusion)
-                        stage_counts['fusion'] += 1
-                        stage_memory['fusion'] += (torch.cuda.max_memory_allocated() - mem_before_fusion)
-                
-            
+
                 if iteration % opt.opacity_reset_interval == 0:
                     gaussians.reset_opacity(0.05)
 
