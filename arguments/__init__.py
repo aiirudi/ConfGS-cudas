@@ -124,7 +124,7 @@ class OptimizationParams(ParamGroup):
 
         # Conf parameter
         self.conf_min_views = 3
-        self.conf_thr = 0.9
+        self.conf_thr = 0.85
 
         # ---- 候选点选择策略参数 ----
         # 策略选择: and | or | abs_only | conf_only | weighted_score | soft_fusion | rfas_rank
@@ -163,12 +163,12 @@ class OptimizationParams(ParamGroup):
         self.candidate_rfas_topk_ratio = 0.05
 
         # Conf 候选点可视化参数
-        self.visualize_conf = False
+        self.visualize_conf = True
         self.conf_vis_iterations = []
-        self.conf_vis_all_intervals = False
+        self.conf_vis_all_intervals = True
         self.conf_vis_point_radius = 3
-        self.conf_vis_max_points = 5000
-        self.conf_vis_mask_type = 'conf'
+        self.conf_vis_max_points = 1000
+        self.conf_vis_mask_type = 'both'
 
         # 统计日志
         self.candidate_stats_enabled = True
