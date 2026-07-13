@@ -10,7 +10,7 @@ import subprocess
 # ============================================================
 SPATIAL_DIVERSITY_ENABLED = True     # True=启用, False=关闭, None=使用默认
 SPATIAL_VOXEL_SIZE = 'auto'         # 'auto' = 自适应, 数值字符串如 '0.5'
-SPATIAL_VOXEL_SCALE = 2.0           # 自适应体素尺寸系数
+SPATIAL_VOXEL_SCALE = 10.0           # 自适应体素尺寸系数
 SPATIAL_METHOD = 'voxel'            # 空间选择方法 (仅 voxel 已实现)
 # ============================================================
 
@@ -39,20 +39,19 @@ paramList = [
 
 paramList = [
     # MipNeRF-360
-    #['bicycle',   'mipnerf', 3000_000],
-    #['flowers',   'mipnerf', 1500_000],
-    #['garden',    'mipnerf', 3000_000],
-    #['stump',     'mipnerf', 3000_000],
-    #['treehill',  'mipnerf', 1500_000],
-
-    #['bonsai',    'mipnerf', 1000_000],
-    #['counter',   'mipnerf', 1000_000],
-    #['kitchen',   'mipnerf', 1000_000],
-    #['room',      'mipnerf', 1000_000],
-
+    ['bicycle',   'mipnerf', 3000_000],
+    ['flowers',   'mipnerf', 1500_000],
+    ['garden',    'mipnerf', 3000_000],
+    ['stump',     'mipnerf', 3000_000],
+    ['treehill',  'mipnerf', 1500_000],
+    ['bonsai',    'mipnerf', 1000_000],
+    ['counter',   'mipnerf', 1000_000],
+    ['kitchen',   'mipnerf', 1000_000],
+    ['room',      'mipnerf', 1000_000],
+    
     # Deep Blending
-    #['drjohnson', 'db',      1500_000],
-    #['playroom',  'db',      1000_000],
+    ['drjohnson', 'db',      1500_000],
+    ['playroom',  'db',      1000_000],
 
     # Tanks & Temples
     ['train',     'tt',      1250_000],
@@ -61,7 +60,6 @@ paramList = [
 
 DATA_ROOT = '/workspace/dataset/'
 ALL_METRICS = {}
-
 def build_spatial_flags():
     """根据 SPATIAL_DIVERSITY_ENABLED 构建命令行参数。"""
     if SPATIAL_DIVERSITY_ENABLED is None:
