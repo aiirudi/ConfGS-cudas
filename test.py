@@ -84,7 +84,6 @@ for data, group, budget in paramList:
 
     t_start = time.time()
     cmd = f'python train.py -s {src} -m {out} --budget {budget} --profile_components{SPATIAL_FLAGS}'
-    print(f'  CMD: {cmd}')
     os.system(cmd)
     t_end = time.time()
     elapsed = int(t_end - t_start)
