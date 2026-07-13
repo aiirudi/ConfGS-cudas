@@ -56,7 +56,7 @@ for data, group, budget in paramList:
     out = f'output/{data}'
 
     t_start = time.time()
-    os.system(f'python train.py -s {src} -m {out} --budget {budget} --profile_components --visualize_conf --conf_vis_all_intervals --conf_vis_mask_type all')
+    os.system(f'python train.py -s {src} -m {out} --budget {budget} --profile_components --visualize_conf --conf_vis_all_intervals')
     t_end = time.time()
     elapsed = int(t_end - t_start)
     train_time_str = f'{elapsed // 60}分{elapsed % 60}秒'
