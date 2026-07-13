@@ -3,6 +3,17 @@ import json
 import time
 import subprocess
 
+# ============================================================
+# 空间多样性候选选择器配置 (通过代码控制, 无需命令行传参)
+# 优先级: 此处的 True/False 会作为 --enable_spatial_diversity 传给 train.py
+#          设置为 None 则使用 arguments/__init__.py 中的默认值 (当前默认 True)
+# ============================================================
+SPATIAL_DIVERSITY_ENABLED = True     # True=启用, False=关闭, None=使用默认
+SPATIAL_VOXEL_SIZE = 'auto'         # 'auto' = 自适应, 数值字符串如 '0.5'
+SPATIAL_VOXEL_SCALE = 2.0           # 自适应体素尺寸系数
+SPATIAL_METHOD = 'voxel'            # 空间选择方法 (仅 voxel 已实现)
+# ============================================================
+
 """
 paramList = [
     # MipNeRF-360
@@ -51,12 +62,30 @@ paramList = [
 DATA_ROOT = '/workspace/dataset/'
 ALL_METRICS = {}
 
+def build_spatial_flags():
+    """根据 SPATIAL_DIVERSITY_ENABLED 构建命令行参数。"""
+    if SPATIAL_DIVERSITY_ENABLED is None:
+        return ''  # 使用 arguments/__init__.py 默认值
+    if SPATIAL_DIVERSITY_ENABLED:
+        flags = ' --enable_spatial_diversity'
+        flags += f' --spatial_diversity_method {SPATIAL_METHOD}'
+        flags += f' --spatial_voxel_size {SPATIAL_VOXEL_SIZE}'
+        flags += f' --spatial_voxel_scale {SPATIAL_VOXEL_SCALE}'
+        return flags
+    # 显式 False: 传入标志确保关闭 (覆盖默认 True)
+    return ''  # 不传 --enable_spatial_diversity → 使用 store_true 的默认行为
+
+
+SPATIAL_FLAGS = build_spatial_flags()
+
 for data, group, budget in paramList:
     src = f'{DATA_ROOT}/{group}/{data}'
     out = f'output/{data}'
 
     t_start = time.time()
-    os.system(f'python train.py -s {src} -m {out} --budget {budget} --profile_components --visualize_conf --conf_vis_all_intervals')
+    cmd = f'python train.py -s {src} -m {out} --budget {budget} --profile_components{SPATIAL_FLAGS}'
+    print(f'  CMD: {cmd}')
+    os.system(cmd)
     t_end = time.time()
     elapsed = int(t_end - t_start)
     train_time_str = f'{elapsed // 60}分{elapsed % 60}秒'

@@ -164,7 +164,7 @@ class OptimizationParams(ParamGroup):
 
         # ---- 空间多样性候选选择器参数 ----
         # 是否启用空间多样性模块
-        self.enable_spatial_diversity = False
+        self.enable_spatial_diversity = True
         # 空间选择方法: voxel | radius_nms | soft_suppression
         self.spatial_diversity_method = 'voxel'
         # 体素尺寸: 'auto' = 自动从 scale 计算; 数值字符串如 '0.5' 也可
@@ -185,7 +185,7 @@ class OptimizationParams(ParamGroup):
         self.spatial_suppression_weight = 1.0
 
         # Conf 候选点可视化参数
-        self.visualize_conf = True
+        self.visualize_conf = False
         self.conf_vis_iterations = []
         self.conf_vis_all_intervals = True
         self.conf_vis_point_radius = 3
