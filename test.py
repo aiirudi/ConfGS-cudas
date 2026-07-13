@@ -87,6 +87,8 @@ for data, group, budget in paramList:
             fps_data = json.load(fp)
         scene_metrics['fps'] = fps_data.get('fps', 0.0)
         scene_metrics['fps_latency_ms'] = fps_data.get('average_ms_per_frame', 0.0)
+    elif fps_ok:
+        print(f"  [WARN] {fps_json_path} not found after successful bench_fps.py run")
     elif not fps_ok:
         print(f"  [WARN] Skipping FPS collection due to bench_fps.py failure")
 

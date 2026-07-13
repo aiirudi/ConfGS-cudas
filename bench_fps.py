@@ -443,7 +443,7 @@ def main():
                 print(f"  Warmup progress: {i+1}/{warmup_frames}")
 
         torch.cuda.synchronize()
-        print(f"  Warmup complete ({warmup_frames} frames)\n")
+        print(f"✓ Warmup complete ({warmup_frames} frames)\n")
 
         # 原始 per-frame timing
         print("Phase 2: Measuring frame-by-frame rendering time...")
@@ -468,7 +468,7 @@ def main():
             if (i + 1) % 50 == 0:
                 print(f"  Progress: {i+1}/{args.num_frames} frames")
 
-        print(f"  Rendered {args.num_frames} frames\n")
+        print(f"✓ Rendered {args.num_frames} frames\n")
 
         # 原始统计分析
         frame_times_ms = np.array(frame_times_ms)
@@ -498,7 +498,7 @@ def main():
         print(f"{'='*80}")
         print(f"FPS Benchmark Results")
         print(f"{'='*80}")
-        print(f"\n  Frame Timing Statistics:")
+        print(f"\n📊 Frame Timing Statistics:")
         print(f"  Mean frame time    : {mean_time:.3f} ms")
         print(f"  Median frame time  : {median_time:.3f} ms")
         print(f"  Std deviation      : {std_time:.3f} ms")
@@ -507,14 +507,14 @@ def main():
         print(f"  5th percentile     : {p5_time:.3f} ms")
         print(f"  95th percentile    : {p95_time:.3f} ms")
 
-        print(f"\n  FPS Metrics:")
+        print(f"\n🎯 FPS Metrics:")
         print(f"  Mean FPS           : {mean_fps:.2f}")
         print(f"  Median FPS         : {median_fps:.2f}")
         print(f"  Stable FPS (5-95%) : {stable_fps:.2f}")
         print(f"  Min FPS            : {min_fps:.2f}")
         print(f"  Max FPS            : {max_fps:.2f}")
 
-        print(f"\n  Performance Assessment:")
+        print(f"\n📈 Performance Assessment:")
         if stable_fps >= 60:
             rating = "Excellent (60+ FPS)"
         elif stable_fps >= 30:
@@ -525,14 +525,14 @@ def main():
             rating = "Poor (<15 FPS)"
         print(f"  Rating: {rating}")
 
-        print(f"\n  Scene Complexity:")
+        print(f"\n🔧 Scene Complexity:")
         print(f"  Gaussians          : {num_gaussians:,}")
         print(f"  Resolution         : {img_width} x {img_height}")
         print(f"  Megapixels         : {(img_width * img_height) / 1e6:.2f} MP")
         print(f"  Gaussians/Megapixel: {num_gaussians / ((img_width * img_height) / 1e6):.0f}")
 
         print(f"\n{'='*80}")
-        print(f"  SUMMARY (Copy this for your paper/report):")
+        print(f"📋 SUMMARY (Copy this for your paper/report):")
         print(f"{'='*80}")
         print(f"Scene: {dataset.model_path.split('/')[-1]}")
         print(f"FPS: {stable_fps:.2f} (stable), {mean_fps:.2f} (mean)")
@@ -542,7 +542,7 @@ def main():
 
         # 原始 per-view 分析
         if len(views) > 1:
-            print(f"\n  Per-View Analysis (testing all {len(views)} views):")
+            print(f"\n🔍 Per-View Analysis (testing all {len(views)} views):")
             view_fps_list = []
 
             for view_id, view in enumerate(views):
