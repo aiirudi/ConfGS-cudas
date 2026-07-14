@@ -8,9 +8,9 @@ import subprocess
 # 优先级: 此处的 True/False 会作为 --enable_spatial_diversity 传给 train.py
 #          设置为 None 则使用 arguments/__init__.py 中的默认值 (当前默认 True)
 # ============================================================
-SPATIAL_DIVERSITY_ENABLED = True     # True=启用, False=关闭, None=使用默认
+SPATIAL_DIVERSITY_ENABLED = False     # True=启用, False=关闭, None=使用默认
 SPATIAL_VOXEL_SIZE = 'auto'         # 'auto' = 自适应, 数值字符串如 '0.5'
-SPATIAL_VOXEL_SCALE = 10.0           # 自适应体素尺寸系数
+SPATIAL_VOXEL_SCALE = 2           # 自适应体素尺寸系数
 SPATIAL_METHOD = 'voxel'            # 空间选择方法 (仅 voxel 已实现)
 # ============================================================
 

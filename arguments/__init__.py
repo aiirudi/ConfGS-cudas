@@ -172,7 +172,7 @@ class OptimizationParams(ParamGroup):
         # 体素尺寸: 'auto' = 自动从 scale 计算; 数值字符串如 '0.5' 也可
         self.spatial_voxel_size = 'auto'
         # 自动体素尺寸系数 (voxel_size = scale * median(max_scale))
-        self.spatial_voxel_scale = 2.0
+        self.spatial_voxel_scale = 30
         # 每轮每体素最多选择候选数
         self.spatial_max_per_voxel = 1
         # 预算模式: original | fixed | ratio

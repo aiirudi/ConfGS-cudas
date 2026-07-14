@@ -248,6 +248,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         gaussian_importance_rf,
                         mode='weighted'
                     )
+                    tt_importance = gaussian_importance
 
                     # Stop fusion timer right after fuse_importance_scores()
                     if opt.profile_components:
