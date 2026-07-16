@@ -192,7 +192,7 @@ class OptimizationParams(ParamGroup):
         self.conf_vis_all_intervals = True
         self.conf_vis_point_radius = 3
         self.conf_vis_max_points = 1000
-        self.conf_vis_mask_type = 'both'
+        self.conf_vis_mask_type = 'all'
 
         # 统计日志
         self.candidate_stats_enabled = True

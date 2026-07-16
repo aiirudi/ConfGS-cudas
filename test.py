@@ -39,19 +39,19 @@ paramList = [
 
 paramList = [
     # MipNeRF-360
-    ['bicycle',   'mipnerf', 3000_000],
-    ['flowers',   'mipnerf', 1500_000],
-    ['garden',    'mipnerf', 3000_000],
-    ['stump',     'mipnerf', 3000_000],
-    ['treehill',  'mipnerf', 1500_000],
-    ['bonsai',    'mipnerf', 1000_000],
-    ['counter',   'mipnerf', 1000_000],
-    ['kitchen',   'mipnerf', 1000_000],
-    ['room',      'mipnerf', 1000_000],
+    #['bicycle',   'mipnerf', 3000_000],
+    #['flowers',   'mipnerf', 1500_000],
+    #['garden',    'mipnerf', 3000_000],
+    #['stump',     'mipnerf', 3000_000],
+    #['treehill',  'mipnerf', 1500_000],
+    #['bonsai',    'mipnerf', 1000_000],
+    #['counter',   'mipnerf', 1000_000],
+    #['kitchen',   'mipnerf', 1000_000],
+    #['room',      'mipnerf', 1000_000],
     
     # Deep Blending
-    ['drjohnson', 'db',      1500_000],
-    ['playroom',  'db',      1000_000],
+    #['drjohnson', 'db',      1500_000],
+    #['playroom',  'db',      1000_000],
 
     # Tanks & Temples
     ['train',     'tt',      1250_000],
@@ -81,7 +81,12 @@ for data, group, budget in paramList:
     out = f'output/{data}'
 
     t_start = time.time()
-    cmd = f'python train.py -s {src} -m {out} --budget {budget} --profile_components{SPATIAL_FLAGS}'
+    cmd = (
+        f'python train.py -s {src} -m {out} '
+        f'--budget {budget} --profile_components '
+        f'--visualize_conf --conf_vis_mask_type all'
+        f'{SPATIAL_FLAGS}'
+    )
     os.system(cmd)
     t_end = time.time()
     elapsed = int(t_end - t_start)
