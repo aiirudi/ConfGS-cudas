@@ -84,6 +84,12 @@ For GPU-less Docker builds, the Dockerfile defaults to `TORCH_CUDA_ARCH_LIST=8.0
 
 Training now uses `conf_only` by default. A Gaussian is eligible for LAS when its CUDA Conf score reaches `--conf_thr`, its norm sum is positive, and it has at least `--conf_min_views` distinct visible training cameras in its recent-view window. The default `--conf_window_size` is 3; choose `2 <= conf_min_views <= conf_window_size`. The existing EAS and RFAS computations and their fused ranking score still determine which eligible Gaussian is sampled first. Legacy candidate strategies (`and`, `or`, `abs_only`, `weighted_score`, `soft_fusion`, `rfas_rank`) raise an explicit error in the CUDA Conf training path because they depend on or bypass the new gate; use `--candidate_selection_strategy conf_only`. For fixed candidate budgets, choose `fixed_number` or `fixed_ratio`; `match_and` depends on the removed abs-gradient gate.
 
+```bash
+python train.py -s /path/to/scene -m output/conf --conf_window_size 3 --conf_min_views 2 --conf_thr 0.85
+```
+
+`--conf_window_size` is each Gaussian's window capacity N (default 3). `--conf_min_views` is the minimum number of distinct, actually visible views required before splitting is allowed (default 2, preserving the existing configuration). See the [design](docs/conf_cuda_design.md), [validation](docs/conf_cuda_validation.md), and [review](docs/conf_cuda_review.md) documents for details.
+
 Each Gaussian retains its most recent distinct cameras that actually contributed pixels. A visible zero-gradient observation occupies a slot; an invisible or invalid observation leaves that Gaussian's history unchanged. Revisiting a camera refreshes its slot, and a new camera evicts the oldest slot when the window is full. Histories persist across densification intervals and follow surviving Gaussians through pruning; new split rows start empty. Observations still come from different training steps, so the window is not a frozen-model comparison. At window size 3, the resident state uses about 96 bytes per Gaussian, plus a transient 16-byte sample when collection is enabled. CUDA Conf is a detached density statistic; optimization still uses the real loss gradients. The rasterizer currently requires the CUDA default stream; its Python wrapper reports an error on another stream.
 
 ## Parameters
