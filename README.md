@@ -70,6 +70,18 @@ data
 
 You can also run the code in the same way as 3DGS.
 
+### CUDA Conf densification
+
+Rebuild the local rasterizer after updating this checkout:
+
+```bash
+python -m pip install -v --no-build-isolation -e submodules/diff-gaussian-rasterization
+```
+
+Training now uses `conf_only` by default. A Gaussian is eligible for LAS when its CUDA Conf score reaches `--conf_thr` and it has at least `--conf_min_views` distinct informative training cameras. The existing EAS and RFAS computations and their fused ranking score still determine which eligible Gaussian is sampled first. Legacy candidate strategies (`and`, `or`, `abs_only`, `weighted_score`, `soft_fusion`, `rfas_rank`) raise an explicit error in the CUDA Conf training path because they depend on or bypass the new gate; use `--candidate_selection_strategy conf_only`. For fixed candidate budgets, choose `fixed_number` or `fixed_ratio`; `match_and` depends on the removed abs-gradient gate.
+
+Conf collects the first backward observation for each camera ID within each densification interval. Zero or invalid per-Gaussian gradients do not count as views. A later visit to the same camera in that interval is ignored, even if a Gaussian became visible later. The window resets at each densification boundary or topology reset. The state uses float32 vector, norm, and score plus int32 view count (24 bytes per Gaussian), with a transient 16-byte sample when collection is enabled. CUDA Conf is a detached density statistic; optimization still uses the real loss gradients. The rasterizer currently requires the CUDA default stream; its Python wrapper reports an error on another stream.
+
 ## Parameters
 
 `SparseAdam` : `SparseAdam` is equivalent to enabling, from the beginning, a multi-resolution update (MU) strategy applied only to the SH coefficients at an interval of 16. While this can significantly improve training speed, it also has a notable negative impact on rendering quality. Therefore, we keep `SparseAdam` disabled by default.

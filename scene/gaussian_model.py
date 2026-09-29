@@ -13,7 +13,7 @@ import math
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, identity_gate
-from utils.candidate_selector import select_densification_candidates
+from utils.candidate_selector import apply_fixed_budget
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -43,11 +43,12 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         
-        # 新增计算 Conf 的梯度累积向量
-        self.xyz_gradient_vec_accum = torch.empty(0)
-        self.xyz_gradient_mag_accum = torch.empty(0)
-        # Conf valid-view counter (separate from scalar EAS denom)
-        self.xyz_gradient_conf_denom = torch.empty(0)
+        self.conf_world_sum = torch.empty(0)
+        self.conf_norm_sum = torch.empty(0)
+        self.conf_view_count = torch.empty(0, dtype=torch.int32)
+        self.conf_score = torch.empty(0)
+        self.conf_camera_keys = set()
+        self.conf_topology_version = 0
         # 候选选择统计（每次 densification 时更新）
         self.candidate_stats = {}
 
@@ -87,9 +88,20 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.shoptimizer.state_dict(),
             self.spatial_lr_scale,
+            {
+                'version': 1,
+                'world_sum': self.conf_world_sum,
+                'norm_sum': self.conf_norm_sum,
+                'view_count': self.conf_view_count,
+                'score': self.conf_score,
+                'camera_keys': list(self.conf_camera_keys),
+            },
         )
     
     def restore(self, model_args, training_args):
+        if len(model_args) not in (12, 13):
+            raise ValueError('Unsupported Gaussian checkpoint format')
+        conf_state = model_args[12] if len(model_args) == 13 else None
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -101,10 +113,27 @@ class GaussianModel:
         denom,
         opt_dict, 
         shopt_dict,
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = model_args[:12]
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        if conf_state is not None:
+            if not isinstance(conf_state, dict) or conf_state.get('version') != 1:
+                raise ValueError('Unsupported Conf checkpoint state')
+            n = self.get_xyz.shape[0]
+            specs = [('world_sum', (n, 3), torch.float32),
+                     ('norm_sum', (n, 1), torch.float32),
+                     ('view_count', (n, 1), torch.int32),
+                     ('score', (n, 1), torch.float32)]
+            for key, shape, dtype in specs:
+                value = conf_state.get(key)
+                if not isinstance(value, torch.Tensor) or value.shape != shape or value.dtype != dtype or value.device != self.get_xyz.device:
+                    raise ValueError(f'Invalid Conf checkpoint tensor: {key}')
+            self.conf_world_sum = conf_state['world_sum'].contiguous()
+            self.conf_norm_sum = conf_state['norm_sum'].contiguous()
+            self.conf_view_count = conf_state['view_count'].contiguous()
+            self.conf_score = conf_state['score'].contiguous()
+            self.conf_camera_keys = set(conf_state.get('camera_keys', ()))
         self.optimizer.load_state_dict(opt_dict)
         self.shoptimizer.load_state_dict(shopt_dict)
 
@@ -178,10 +207,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
-        self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 3), device='cuda')
-        self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
-        self.xyz_gradient_conf_denom = torch.zeros((self.get_xyz.shape[0], 1), device='cuda')
+        self.reset_conf_window()
 
         # 初始化冷却计数器 (初始全部为0,表示可以立即参与分裂)
         #self.split_cooldown = torch.zeros((self.get_xyz.shape[0], 1), device='cuda', dtype=torch.int32)
@@ -331,6 +357,29 @@ class GaussianModel:
                     optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
+    def reset_conf_window(self):
+        """Start a new camera-distinct Conf accumulation window."""
+        n = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        self.conf_world_sum = torch.zeros((n, 3), device=device, dtype=torch.float32)
+        self.conf_norm_sum = torch.zeros((n, 1), device=device, dtype=torch.float32)
+        self.conf_view_count = torch.zeros((n, 1), device=device, dtype=torch.int32)
+        self.conf_score = torch.zeros((n, 1), device=device, dtype=torch.float32)
+        self.conf_camera_keys = set()
+
+    @torch.no_grad()
+    def add_conf_stats(self, samples, camera_key):
+        """Admit one training backward sample per camera in the current window."""
+        if camera_key in self.conf_camera_keys:
+            return False
+        if not isinstance(samples, torch.Tensor) or samples.shape != (self.get_xyz.shape[0], 4):
+            raise ValueError('Conf samples must have shape (N,4) for current topology')
+        from diff_gaussian_rasterization import accumulate_conf
+        accumulate_conf(samples.detach(), self.conf_world_sum, self.conf_norm_sum,
+                        self.conf_view_count, self.conf_score)
+        self.conf_camera_keys.add(camera_key)
+        return True
+
     def prune_points(self, mask):
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
@@ -345,10 +394,11 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
 
-        # 同样对新加入 Conf 的统计量修改
-        self.xyz_gradient_vec_accum = self.xyz_gradient_vec_accum[valid_points_mask]
-        self.xyz_gradient_mag_accum = self.xyz_gradient_mag_accum[valid_points_mask]
-        self.xyz_gradient_conf_denom = self.xyz_gradient_conf_denom[valid_points_mask]
+        self.conf_world_sum = self.conf_world_sum[valid_points_mask]
+        self.conf_norm_sum = self.conf_norm_sum[valid_points_mask]
+        self.conf_view_count = self.conf_view_count[valid_points_mask]
+        self.conf_score = self.conf_score[valid_points_mask]
+        self.conf_topology_version += 1
 
         # 同步修剪冷却计数器
         #self.split_cooldown = self.split_cooldown[valid_points_mask]
@@ -398,10 +448,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
-        self.xyz_gradient_vec_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
-        self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.xyz_gradient_conf_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.reset_conf_window()
+        self.conf_topology_version += 1
 
         # 重置冷却计数器
         #self.split_cooldown = torch.zeros((self.get_xyz.shape[0],1), device="cuda", dtype=torch.int32)
@@ -414,9 +462,9 @@ class GaussianModel:
             opacity_array = self.get_opacity.detach().flatten()
             q = min_opacity
             min_opacity = torch.quantile(opacity_array, q)
-            prune_mask = (self.get_opacity < min_opacity).squeeze()
+            prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         else:
-            prune_mask = (self.get_opacity < min_opacity).squeeze()
+            prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
 
         valid_points_mask = ~prune_mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
@@ -431,10 +479,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        # Conf world-space gradient accumulators (3D vectors pulled back from NDC)
-        self.xyz_gradient_vec_accum= torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
-        self.xyz_gradient_mag_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.xyz_gradient_conf_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.reset_conf_window()
+        self.conf_topology_version += 1
 
         # 重置冷却计数器
         #self.split_cooldown = torch.zeros((self.get_xyz.shape[0],1), device="cuda", dtype=torch.int32)
@@ -442,77 +488,69 @@ class GaussianModel:
         torch.cuda.empty_cache()
     
     def densify_and_prune_Improved(self, scores, min_opacity, budget, opt, iteration, limitation, residual_offsets=None, rfas_score=None, vis_context=None):
-        # grad_vars.shape: (N, 1)
-        grad_vars = self.xyz_gradient_accum / self.denom
-        grad_vars[grad_vars.isnan()] = 0.0
-        
-        min_grad = opt.densify_grad_threshold
+        strategy = getattr(opt, 'candidate_selection_strategy', 'conf_only')
+        if strategy != 'conf_only':
+            raise ValueError(f"CUDA Conf supports candidate_selection_strategy='conf_only'; got {strategy!r}. Abs-dependent strategies require the legacy rasterizer.")
 
-        # 统一 scores 形状为 (N,)
-        if scores is None or iteration > 14500:
-            scores = grad_vars.squeeze()  # (N,)
-            if self.get_opacity.shape[0] < budget and iteration > 14500:
-                min_grad = min_grad / 1.5
+        n = self.get_xyz.shape[0]
+        num_gaussians_before = n
+        conf = self.conf_score.reshape(-1)
+        min_views = getattr(opt, 'conf_min_views', 2)
+        conf_mask = (self.conf_view_count.reshape(-1) >= min_views) & torch.isfinite(conf) & (conf >= getattr(opt, 'conf_thr', 0.85))
+        if scores is None:
+            selection_score = conf.clone()
         else:
-            # 确保传入的 scores 也是 (N,)
-            if scores.dim() > 1:
-                scores = scores.squeeze()
-        
-        # 计算 abs-grad 布尔掩码
-        abs_mask = torch.where(torch.norm(grad_vars, dim=-1) >= min_grad, True, False)
+            selection_score = scores.reshape(-1).clone()
+            if selection_score.numel() != n:
+                raise ValueError('Ranking scores must contain one value per Gaussian')
+        finite_score = torch.isfinite(selection_score)
+        final_mask = conf_mask & finite_score
+        selection_score[~finite_score] = 0.0
 
-        # 计算冲突度
-        conf = 1.0 - (torch.norm(self.xyz_gradient_vec_accum, dim=-1, keepdim=True)) / (self.xyz_gradient_mag_accum + 1e-6)
-        conf[conf.isnan()] = 0.0
-        # Zero valid views: no meaningful gradient observations
-        zero_views = (self.xyz_gradient_conf_denom <= 0).squeeze(-1)
-        conf[zero_views] = 0.0
-        conf = conf.squeeze(-1)  # (N,)
-        min_views = getattr(opt, "conf_min_views", 3)
-        conf_thr = getattr(opt, "conf_thr", 0.8)
-        has_enough_views = (self.xyz_gradient_conf_denom.squeeze(-1) >= min_views)  # (N,)
-        conf_mask_raw = (conf >= conf_thr)  # (N,)
-        # conf_mask 始终包含 has_enough_views
-        conf_mask = conf_mask_raw & has_enough_views
+        budget_mode = getattr(opt, 'candidate_budget_mode', 'native')
+        target_budget = int(final_mask.sum().item())
+        actual_budget = target_budget
+        if budget_mode == 'fixed':
+            reference = getattr(opt, 'candidate_budget_reference', 'match_and')
+            if reference == 'match_and':
+                raise ValueError('candidate_budget_reference=match_and requires abs-grad; use fixed_number or fixed_ratio with CUDA Conf')
+            if reference not in ('fixed_number', 'fixed_ratio'):
+                raise ValueError(f'Unsupported Conf budget reference: {reference}')
+            final_mask, actual_budget, target_budget = apply_fixed_budget(
+                final_mask, selection_score, target_budget, reference, opt,
+                strategy='conf_only')
+        elif budget_mode != 'native':
+            raise ValueError(f'Unsupported Conf budget mode: {budget_mode}')
 
-        # 候选点选择策略（仅 iter <= 14500 使用；之后回退到原始 abs-grad 行为）
-        strategy = getattr(opt, "candidate_selection_strategy", "and")
-        num_gaussians_before = len(self.get_xyz)
+        # LAS samples by weight; a valid Conf candidate with a zero fused
+        # score must remain eligible rather than silently disappearing.
+        selection_score[final_mask] = selection_score[final_mask].clamp_min(1e-6)
 
-        if iteration > 14500:
-            # post-14500 统一回退：仍走 selector 统计路线以确保 CSV 字段完整
-            # 回退策略 and 属于布尔策略, 始终用融合分数 scores (=grad_vars) 做采样权重
-            _rfas = scores  # grad_vars (回退到原始梯度幅度)
-            final_mask, selection_score, _stats = select_densification_candidates(
-                abs_score=grad_vars,
-                conf_score=conf,
-                rfas_score=_rfas,
-                abs_mask=abs_mask,
-                conf_mask=conf_mask,
-                strategy='and',
-                config=opt,
-            )
-            self.candidate_stats = _stats
-            self.candidate_stats['strategy'] = 'and (fallback)'
-            self.candidate_stats['iteration'] = iteration
-        else:
-            # 布尔策略用融合分数 (scores), 连续策略用原始 RFAS
-            # 保证默认 and 策略下 selection_score = 融合 EAS+RFAS
-            if strategy in ('and', 'or', 'abs_only', 'conf_only'):
-                _rfas = scores  # 融合分数 tt_importance
-            else:
-                _rfas = rfas_score if rfas_score is not None else scores
-            final_mask, selection_score, _stats = select_densification_candidates(
-                abs_score=grad_vars,
-                conf_score=conf,
-                rfas_score=_rfas,
-                abs_mask=abs_mask,
-                conf_mask=conf_mask,
-                strategy=strategy,
-                config=opt,
-            )
-            self.candidate_stats = _stats
-            self.candidate_stats['iteration'] = iteration
+        def scalar_stats(values):
+            values = values[torch.isfinite(values)]
+            if values.numel() == 0:
+                return (0.0,) * 5
+            return tuple(float(x.item()) for x in (
+                values.mean(), values.std(unbiased=False), values.median(),
+                values.min(), values.max()))
+
+        conf_stats = scalar_stats(conf)
+        rank_stats = scalar_stats(selection_score)
+        self.candidate_stats = {
+            'strategy': 'conf_only', 'iteration': iteration,
+            'n_valid': n, 'n_conf_candidates': int(conf_mask.sum().item()),
+            'n_final_candidates': int(final_mask.sum().item()),
+            'candidate_ratio': float(final_mask.sum().item()) / max(n, 1),
+            'target_budget': target_budget, 'actual_budget': actual_budget,
+            'conf_mean': conf_stats[0], 'conf_std': conf_stats[1],
+            'conf_median': conf_stats[2], 'conf_min': conf_stats[3],
+            'conf_max': conf_stats[4],
+            'sel_score_mean': rank_stats[0], 'sel_score_std': rank_stats[1],
+            'sel_score_median': rank_stats[2], 'sel_score_min': rank_stats[3],
+            'sel_score_max': rank_stats[4],
+            'n_nan': int(torch.isnan(conf).sum().item()),
+            'n_inf': int(torch.isinf(conf).sum().item()),
+        }
 
         total_sum = torch.sum(final_mask).item()
         curr_points = num_gaussians_before
@@ -529,7 +567,7 @@ class GaussianModel:
                 self, conf_mask, conf,
                 final_mask, selection_score,
                 vis_context, opt,
-                abs_mask=abs_mask, abs_score=grad_vars,
+                abs_mask=None, abs_score=None,
             )
 
         # ---- 空间多样性候选选择器 (后处理模块) ----
@@ -603,7 +641,7 @@ class GaussianModel:
             )
             num_split = min(all_budget, int(final_mask.sum().item()))
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze(-1)
         num_pruned = 0
 
         if iteration < 14900:
@@ -629,8 +667,9 @@ class GaussianModel:
         are represented in the same world-space coordinate frame.
 
         The NDC Jacobian for row-vector convention (clip = xyz_h @ M):
-          d(ndc_x)/d(xyz_i) = (M[i,0]*qw - M[i,3]*qx) / qw^2
-          d(ndc_y)/d(xyz_i) = (M[i,1]*qw - M[i,3]*qy) / qw^2
+          r = 1 / (qw + 1e-7)
+          d(ndc_x)/d(xyz_i) = M[i,0]*r - M[i,3]*qx*r^2
+          d(ndc_y)/d(xyz_i) = M[i,1]*r - M[i,3]*qy*r^2
         J_ndc ∈ R^{2×3}, g_world = J_ndc^T @ g_ndc ∈ R^3
 
         Args:
@@ -658,8 +697,9 @@ class GaussianModel:
         qy = clip[:, 1]  # (n,)
         qw = clip[:, 3]  # (n,)
 
-        # Exclude points at or behind the camera plane (positive clip_w convention)
-        safe_qw = torch.where(qw > eps, qw, torch.full_like(qw, eps))
+        # Match preprocessCUDA's stabilized projection exactly. Invalid rows
+        # use a safe denominator only to keep this reference helper finite.
+        reciprocal_w = torch.where(qw > eps, 1.0 / (qw + 1e-7), torch.zeros_like(qw))
 
         # Extract matrix columns for the xyz rows (indices 0,1,2) of the
         # projection-matrix rows that participate in ndc_x, ndc_y, and w.
@@ -670,8 +710,8 @@ class GaussianModel:
         Mw_xyz = full_proj_transform[:3, 3]  # (3,)  column 3, rows 0..2
 
         # Jacobian rows: d(ndc_x)/d(xyz) and d(ndc_y)/d(xyz)
-        jac_x = (Mx_xyz[None, :] * safe_qw[:, None] - Mw_xyz[None, :] * qx[:, None]) / safe_qw[:, None].square()  # (n, 3)
-        jac_y = (My_xyz[None, :] * safe_qw[:, None] - Mw_xyz[None, :] * qy[:, None]) / safe_qw[:, None].square()  # (n, 3)
+        jac_x = Mx_xyz[None, :] * reciprocal_w[:, None] - Mw_xyz[None, :] * qx[:, None] * reciprocal_w[:, None].square()
+        jac_y = My_xyz[None, :] * reciprocal_w[:, None] - Mw_xyz[None, :] * qy[:, None] * reciprocal_w[:, None].square()
 
         # J_ndc: (n, 2, 3), then g_world = J_ndc^T @ g_ndc
         jacobian = torch.stack([jac_x, jac_y], dim=1)  # (n, 2, 3)
@@ -697,68 +737,10 @@ class GaussianModel:
         return g_world, valid
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, viewpoint_cam=None):
-        # Normalize update_filter to 1D indices (nonzero() returns (n,1) in some versions)
-        idx = update_filter.view(-1) if update_filter.dim() > 1 else update_filter
-        self.xyz_gradient_accum[idx] += torch.norm(viewspace_point_tensor.grad[idx,:2], dim=-1, keepdim=True)
+        raise RuntimeError('Python densification gradient accumulation is obsolete; use CUDA Conf samples')
 
-        # Conf: pull per-view NDC-space positional gradient back to world-space
-        # via the camera projection Jacobian transpose, then accumulate the
-        # 3D world-space vector and its norm.
-        if viewpoint_cam is not None:
-            g_ndc = viewspace_point_tensor.grad[idx, :2].detach()  # (n,2) dL/d(NDC_xy)
-            g_world, valid = self._compute_ndc_vjp_world(
-                self.get_xyz.detach(),
-                g_ndc,
-                idx,
-                viewpoint_cam.full_proj_transform,
-            )
-            # Only accumulate for Gaussians with valid world gradients
-            self.xyz_gradient_vec_accum[valid] += g_world[valid]
-            self.xyz_gradient_mag_accum[valid] += torch.norm(g_world[valid], dim=-1, keepdim=True)
-            self.xyz_gradient_conf_denom[valid] += 1
-        else:
-            # Fallback: original 2D NDC accumulation (backward compatibility)
-            # Pad to 3D with zero z-component to match the (N,3) accumulator
-            g = viewspace_point_tensor.grad[idx, :2]  # (n,2)
-            g_pad = torch.cat([g, torch.zeros_like(g[:, :1])], dim=-1)  # (n,3)
-            self.xyz_gradient_vec_accum[idx] += g_pad
-            self.xyz_gradient_mag_accum[idx] += torch.norm(g, dim=-1, keepdim=True)
-            self.xyz_gradient_conf_denom[idx] += 1
-
-        # EAS scalar denom unchanged
-        self.denom[idx] += 1
-
-    # EAS 中的计算视角绝对值
     def add_densification_stats_abs(self, viewspace_point_tensor, update_filter, viewpoint_cam=None):
-        # Normalize update_filter to 1D indices (nonzero() returns (n,1) in some versions)
-        idx = update_filter.view(-1) if update_filter.dim() > 1 else update_filter
-        self.xyz_gradient_accum[idx] += torch.norm(viewspace_point_tensor.grad[idx,2:], dim=-1, keepdim=True)
-
-        # Conf: pull per-view NDC-space positional gradient back to world-space
-        # via the camera projection Jacobian transpose, then accumulate the
-        # 3D world-space vector and its norm.
-        if viewpoint_cam is not None:
-            g_ndc = viewspace_point_tensor.grad[idx, :2].detach()  # (n,2) dL/d(NDC_xy)
-            g_world, valid = self._compute_ndc_vjp_world(
-                self.get_xyz.detach(),
-                g_ndc,
-                idx,
-                viewpoint_cam.full_proj_transform,
-            )
-            self.xyz_gradient_vec_accum[valid] += g_world[valid]
-            self.xyz_gradient_mag_accum[valid] += torch.norm(g_world[valid], dim=-1, keepdim=True)
-            self.xyz_gradient_conf_denom[valid] += 1
-        else:
-            # Fallback: original 2D NDC accumulation (backward compatibility)
-            # Pad to 3D with zero z-component to match the (N,3) accumulator
-            g = viewspace_point_tensor.grad[idx, :2]  # (n,2)
-            g_pad = torch.cat([g, torch.zeros_like(g[:, :1])], dim=-1)  # (n,3)
-            self.xyz_gradient_vec_accum[idx] += g_pad
-            self.xyz_gradient_mag_accum[idx] += torch.norm(g, dim=-1, keepdim=True)
-            self.xyz_gradient_conf_denom[idx] += 1
-
-        # EAS scalar denom unchanged
-        self.denom[idx] += 1
+        raise RuntimeError('Abs-gradient accumulation was removed; use CUDA Conf samples')
 
     # LAS 实现: 按 score 加权（multinomial）从可分裂候选中采 budget 个父高斯，
     # 仅沿最长 scaling 轴分裂为两个子高斯（±split_distance·3σ_long），

@@ -84,8 +84,6 @@ for data, group, budget in paramList:
     cmd = (
         f'python train.py -s {src} -m {out} '
         f'--budget {budget} --profile_components '
-        f'--visualize_conf --conf_vis_mask_type all'
-        f'{SPATIAL_FLAGS}'
     )
     os.system(cmd)
     t_end = time.time()

@@ -359,6 +359,7 @@ __global__ void preprocessCUDA(
 	const float* proj,
 	const glm::vec3* campos,
 	const float4* dL_dmean2D,
+	float4* conf_samples,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
 	float* dL_dcov3D,
@@ -385,6 +386,16 @@ __global__ void preprocessCUDA(
 	dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
 	dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
 	dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
+
+	// Conf observes only the projection path. The optimization gradient below
+	// must still include the covariance and SH paths.
+	if (conf_samples != nullptr && isfinite(m_hom.w) && m_hom.w > 1e-8f &&
+		isfinite(dL_dmean2D[idx].x) && isfinite(dL_dmean2D[idx].y))
+	{
+		float magnitude = hypotf(hypotf(dL_dmean.x, dL_dmean.y), dL_dmean.z);
+		if (isfinite(magnitude) && magnitude > 0.0f)
+			conf_samples[idx] = make_float4(dL_dmean.x, dL_dmean.y, dL_dmean.z, magnitude);
+	}
 
 	// That's the second part of the mean gradient. Previous computation
 	// of cov2D and following SH conversion also affects it.
@@ -467,8 +478,6 @@ PerGaussianRenderCUDA(
 	// Gradient accumulation variables
 	float Register_dL_dmean2D_x = 0.0f;
 	float Register_dL_dmean2D_y = 0.0f;
-	float Register_dL_dmean2D_z = 0.0f;
-	float Register_dL_dmean2D_w = 0.0f;
 
 	float Register_dL_dconic2D_x = 0.0f;
 	float Register_dL_dconic2D_y = 0.0f;
@@ -587,10 +596,8 @@ PerGaussianRenderCUDA(
 			// accumulate the gradients
 			const float tmp_x = dL_dG * dG_ddelx * ddelx_dx;
 			Register_dL_dmean2D_x += tmp_x;
-			Register_dL_dmean2D_z += fabs(tmp_x);
 			const float tmp_y = dL_dG * dG_ddely * ddely_dy;
 			Register_dL_dmean2D_y += tmp_y;
-			Register_dL_dmean2D_w += fabs(tmp_y);
 
 			Register_dL_dconic2D_x += -0.5f * gdx * d.x * dL_dG;
 			Register_dL_dconic2D_y += -0.5f * gdx * d.y * dL_dG;
@@ -603,8 +610,6 @@ PerGaussianRenderCUDA(
 	if (valid_splat) {
 		atomicAdd(&dL_dmean2D[gaussian_idx].x, Register_dL_dmean2D_x);
 		atomicAdd(&dL_dmean2D[gaussian_idx].y, Register_dL_dmean2D_y);
-		atomicAdd(&dL_dmean2D[gaussian_idx].z, Register_dL_dmean2D_z);
-		atomicAdd(&dL_dmean2D[gaussian_idx].w, Register_dL_dmean2D_w);
 
 
 		atomicAdd(&dL_dconic2D[gaussian_idx].x, Register_dL_dconic2D_x);
@@ -634,6 +639,7 @@ void BACKWARD::preprocess(
 	const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
 	const float4* dL_dmean2D,
+	float4* conf_samples,
 	const float* dL_dconic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
@@ -677,6 +683,7 @@ void BACKWARD::preprocess(
 		projmatrix,
 		campos,
 		(float4*)dL_dmean2D,
+		conf_samples,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,

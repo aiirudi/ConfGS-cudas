@@ -123,12 +123,12 @@ class OptimizationParams(ParamGroup):
         self.opacity_reduction = 0.6
 
         # Conf parameter
-        self.conf_min_views = 3
+        self.conf_min_views = 2
         self.conf_thr = 0.85
 
         # ---- 候选点选择策略参数 ----
         # 策略选择: and | or | abs_only | conf_only | weighted_score | soft_fusion | rfas_rank
-        self.candidate_selection_strategy = 'and'
+        self.candidate_selection_strategy = 'conf_only'
         # 预算模式: native | fixed
         self.candidate_budget_mode = 'native'
         # fixed 预算参考: fixed_number | fixed_ratio | match_and

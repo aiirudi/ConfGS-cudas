@@ -29,6 +29,7 @@ def rasterize_gaussians(
     rotations,
     cov3Ds_precomp,
     raster_settings,
+    conf_stats=None,
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -41,6 +42,7 @@ def rasterize_gaussians(
         rotations,
         cov3Ds_precomp,
         raster_settings,
+        conf_stats,
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -56,8 +58,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         scales,
         rotations,
         cov3Ds_precomp,
-        raster_settings
+        raster_settings,
+        conf_stats,
     ):
+        _require_default_stream(means3D)
 
         # Restructure arguments the way that the C++ lib expects them
         pweights = raster_settings.pixel_weights
@@ -92,18 +96,20 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                num_rendered, num_buckets, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+                result = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, num_buckets, color, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, countBuffer, listBuffer, listBufferRender, listBufferDistance, centers, depths, my_radii, accum_weights, accum_count, accum_blend, accum_dist = _C.rasterize_gaussians(*args)
+            result = _C.rasterize_gaussians(*args)
+        num_rendered, num_buckets, color, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, countBuffer, listBuffer, listBufferRender, listBufferDistance, centers, depths, my_radii, accum_weights, accum_count, accum_blend, accum_dist = result
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.num_buckets = num_buckets
+        ctx.conf_stats = conf_stats
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer)
         return color, radii, countBuffer, listBuffer, listBufferRender, listBufferDistance, centers, depths, my_radii, accum_weights, accum_count, accum_blend, accum_dist
 
@@ -115,6 +121,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = ctx.saved_tensors
+        _require_default_stream(means3D)
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -146,13 +153,17 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_dc, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+                grads_and_conf = _C.rasterize_gaussians_backward(*args, ctx.conf_stats is not None)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_dc, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+            grads_and_conf = _C.rasterize_gaussians_backward(*args, ctx.conf_stats is not None)
+
+        grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_dc, grad_sh, grad_scales, grad_rotations, conf_samples = grads_and_conf
+        if ctx.conf_stats is not None:
+            ctx.conf_stats['samples'] = conf_samples
 
         grads = (
             grad_means3D,
@@ -164,6 +175,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_scales,
             grad_rotations,
             grad_cov3Ds_precomp,
+            None,
             None,
         )
 
@@ -200,7 +212,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, dc = None, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, dc = None, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, conf_stats = None):
         
         raster_settings = self.raster_settings
 
@@ -235,8 +247,23 @@ class GaussianRasterizer(nn.Module):
             scales, 
             rotations,
             cov3D_precomp,
-            raster_settings
+            raster_settings,
+            conf_stats,
         )
+
+
+def accumulate_conf(samples, world_sum, norm_sum, view_count, conf_out):
+    """Update the detached streaming Conf statistic on the CUDA current stream."""
+    return _C.accumulate_conf(samples, world_sum, norm_sum, view_count, conf_out)
+
+
+def _require_default_stream(tensor):
+    # The inherited rasterizer kernels and CUB calls launch on CUDA's default
+    # stream. Its Conf consumer uses the current PyTorch stream, so reject a
+    # mixed-stream call until the entire rasterizer is made stream-aware.
+    device = tensor.device
+    if tensor.is_cuda and torch.cuda.current_stream(device).cuda_stream != torch.cuda.default_stream(device).cuda_stream:
+        raise RuntimeError('Gaussian rasterizer requires the CUDA default stream')
 
 class SparseGaussianAdam(torch.optim.Adam):
     def __init__(self, params, lr, eps):

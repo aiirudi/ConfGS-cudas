@@ -89,6 +89,7 @@ namespace CudaRasterizer
 			char* sample_buffer,
 			const float* dL_dpix,
 			float* dL_dmean2D,
+			float* conf_samples,
 			float* dL_dconic,
 			float* dL_dopacity,
 			float* dL_dcolor,
