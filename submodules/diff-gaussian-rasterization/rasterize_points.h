@@ -69,9 +69,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
 torch::Tensor AccumulateConfCUDA(
 	const torch::Tensor& samples,
+	int64_t camera_id,
+	torch::Tensor& history,
+	torch::Tensor& camera_ids,
+	torch::Tensor& view_count,
 	torch::Tensor& world_sum,
 	torch::Tensor& norm_sum,
-	torch::Tensor& view_count,
 	torch::Tensor& conf_out);
 		
 torch::Tensor markVisible(

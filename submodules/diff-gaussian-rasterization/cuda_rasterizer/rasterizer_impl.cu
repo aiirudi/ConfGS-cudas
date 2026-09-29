@@ -553,6 +553,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.pixel_colors,
 		dL_dpix,
 		(float4*)dL_dmean2D,
+		(float4*)conf_samples,
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor), debug)

@@ -47,7 +47,9 @@ class GaussianModel:
         self.conf_norm_sum = torch.empty(0)
         self.conf_view_count = torch.empty(0, dtype=torch.int32)
         self.conf_score = torch.empty(0)
-        self.conf_camera_keys = set()
+        self.conf_history = torch.empty(0)
+        self.conf_camera_ids = torch.empty(0, dtype=torch.int64)
+        self.conf_window_size = 3
         self.conf_topology_version = 0
         # 候选选择统计（每次 densification 时更新）
         self.candidate_stats = {}
@@ -89,12 +91,14 @@ class GaussianModel:
             self.shoptimizer.state_dict(),
             self.spatial_lr_scale,
             {
-                'version': 1,
+                'version': 2,
+                'window_size': self.conf_window_size,
+                'history': self.conf_history,
+                'camera_ids': self.conf_camera_ids,
                 'world_sum': self.conf_world_sum,
                 'norm_sum': self.conf_norm_sum,
                 'view_count': self.conf_view_count,
                 'score': self.conf_score,
-                'camera_keys': list(self.conf_camera_keys),
             },
         )
     
@@ -118,13 +122,25 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         if conf_state is not None:
-            if not isinstance(conf_state, dict) or conf_state.get('version') != 1:
+            if not isinstance(conf_state, dict) or conf_state.get('version') not in (1, 2):
                 raise ValueError('Unsupported Conf checkpoint state')
+            if conf_state['version'] == 1:
+                # v1 stored only sums and a global camera set; per-Gaussian
+                # history cannot be reconstructed, so start an empty window.
+                conf_state = None
+        if conf_state is not None:
             n = self.get_xyz.shape[0]
+            window = conf_state.get('window_size')
+            if not isinstance(window, int) or window < 2:
+                raise ValueError('Invalid Conf checkpoint window size')
+            if window != self.conf_window_size:
+                raise ValueError(f'Conf checkpoint window size {window} differs from configured conf_window_size {self.conf_window_size}')
             specs = [('world_sum', (n, 3), torch.float32),
                      ('norm_sum', (n, 1), torch.float32),
                      ('view_count', (n, 1), torch.int32),
-                     ('score', (n, 1), torch.float32)]
+                     ('score', (n, 1), torch.float32),
+                     ('history', (n, window, 4), torch.float32),
+                     ('camera_ids', (n, window), torch.int64)]
             for key, shape, dtype in specs:
                 value = conf_state.get(key)
                 if not isinstance(value, torch.Tensor) or value.shape != shape or value.dtype != dtype or value.device != self.get_xyz.device:
@@ -133,7 +149,9 @@ class GaussianModel:
             self.conf_norm_sum = conf_state['norm_sum'].contiguous()
             self.conf_view_count = conf_state['view_count'].contiguous()
             self.conf_score = conf_state['score'].contiguous()
-            self.conf_camera_keys = set(conf_state.get('camera_keys', ()))
+            self.conf_history = conf_state['history'].contiguous()
+            self.conf_camera_ids = conf_state['camera_ids'].contiguous()
+            self.conf_window_size = window
         self.optimizer.load_state_dict(opt_dict)
         self.shoptimizer.load_state_dict(shopt_dict)
 
@@ -204,6 +222,10 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.conf_window_size = int(getattr(training_args, 'conf_window_size', 3))
+        min_views = int(getattr(training_args, 'conf_min_views', 2))
+        if self.conf_window_size < 2 or not 2 <= min_views <= self.conf_window_size:
+            raise ValueError('Conf requires conf_window_size >= 2 and 2 <= conf_min_views <= conf_window_size')
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
@@ -358,27 +380,28 @@ class GaussianModel:
         return optimizable_tensors
 
     def reset_conf_window(self):
-        """Start a new camera-distinct Conf accumulation window."""
+        """Clear the per-Gaussian rolling view history (initialization only)."""
         n = self.get_xyz.shape[0]
         device = self.get_xyz.device
         self.conf_world_sum = torch.zeros((n, 3), device=device, dtype=torch.float32)
         self.conf_norm_sum = torch.zeros((n, 1), device=device, dtype=torch.float32)
         self.conf_view_count = torch.zeros((n, 1), device=device, dtype=torch.int32)
         self.conf_score = torch.zeros((n, 1), device=device, dtype=torch.float32)
-        self.conf_camera_keys = set()
+        self.conf_history = torch.zeros((n, self.conf_window_size, 4), device=device, dtype=torch.float32)
+        self.conf_camera_ids = torch.full((n, self.conf_window_size), -1, device=device, dtype=torch.int64)
 
     @torch.no_grad()
     def add_conf_stats(self, samples, camera_key):
-        """Admit one training backward sample per camera in the current window."""
-        if camera_key in self.conf_camera_keys:
-            return False
+        """Refresh each contributing Gaussian's last-N-view CUDA history."""
+        if int(camera_key) < 0:
+            raise ValueError('Conf camera key must be nonnegative')
         if not isinstance(samples, torch.Tensor) or samples.shape != (self.get_xyz.shape[0], 4):
             raise ValueError('Conf samples must have shape (N,4) for current topology')
         from diff_gaussian_rasterization import accumulate_conf
-        accumulate_conf(samples.detach(), self.conf_world_sum, self.conf_norm_sum,
-                        self.conf_view_count, self.conf_score)
-        self.conf_camera_keys.add(camera_key)
-        return True
+        accumulate_conf(samples.detach(), int(camera_key),
+                        self.conf_history, self.conf_camera_ids,
+                        self.conf_view_count, self.conf_world_sum,
+                        self.conf_norm_sum, self.conf_score)
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
@@ -398,6 +421,8 @@ class GaussianModel:
         self.conf_norm_sum = self.conf_norm_sum[valid_points_mask]
         self.conf_view_count = self.conf_view_count[valid_points_mask]
         self.conf_score = self.conf_score[valid_points_mask]
+        self.conf_history = self.conf_history[valid_points_mask]
+        self.conf_camera_ids = self.conf_camera_ids[valid_points_mask]
         self.conf_topology_version += 1
 
         # 同步修剪冷却计数器
@@ -448,7 +473,17 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        self.reset_conf_window()
+        old_n = self.conf_history.shape[0]
+        new_n = self.get_xyz.shape[0] - old_n
+        if new_n < 0:
+            raise RuntimeError('Gaussian topology shrank during append')
+        device = self.get_xyz.device
+        self.conf_world_sum = torch.cat((self.conf_world_sum, torch.zeros((new_n, 3), device=device)), dim=0)
+        self.conf_norm_sum = torch.cat((self.conf_norm_sum, torch.zeros((new_n, 1), device=device)), dim=0)
+        self.conf_view_count = torch.cat((self.conf_view_count, torch.zeros((new_n, 1), device=device, dtype=torch.int32)), dim=0)
+        self.conf_score = torch.cat((self.conf_score, torch.zeros((new_n, 1), device=device)), dim=0)
+        self.conf_history = torch.cat((self.conf_history, torch.zeros((new_n, self.conf_window_size, 4), device=device)), dim=0)
+        self.conf_camera_ids = torch.cat((self.conf_camera_ids, torch.full((new_n, self.conf_window_size), -1, device=device, dtype=torch.int64)), dim=0)
         self.conf_topology_version += 1
 
         # 重置冷却计数器
@@ -479,7 +514,12 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        self.reset_conf_window()
+        self.conf_world_sum = self.conf_world_sum[valid_points_mask]
+        self.conf_norm_sum = self.conf_norm_sum[valid_points_mask]
+        self.conf_view_count = self.conf_view_count[valid_points_mask]
+        self.conf_score = self.conf_score[valid_points_mask]
+        self.conf_history = self.conf_history[valid_points_mask]
+        self.conf_camera_ids = self.conf_camera_ids[valid_points_mask]
         self.conf_topology_version += 1
 
         # 重置冷却计数器
@@ -490,13 +530,18 @@ class GaussianModel:
     def densify_and_prune_Improved(self, scores, min_opacity, budget, opt, iteration, limitation, residual_offsets=None, rfas_score=None, vis_context=None):
         strategy = getattr(opt, 'candidate_selection_strategy', 'conf_only')
         if strategy != 'conf_only':
-            raise ValueError(f"CUDA Conf supports candidate_selection_strategy='conf_only'; got {strategy!r}. Abs-dependent strategies require the legacy rasterizer.")
+            raise ValueError(f"CUDA Conf supports candidate_selection_strategy='conf_only'; got {strategy!r}. Legacy strategies require or bypass the removed gradient gate.")
 
         n = self.get_xyz.shape[0]
         num_gaussians_before = n
         conf = self.conf_score.reshape(-1)
-        min_views = getattr(opt, 'conf_min_views', 2)
-        conf_mask = (self.conf_view_count.reshape(-1) >= min_views) & torch.isfinite(conf) & (conf >= getattr(opt, 'conf_thr', 0.85))
+        min_views = max(2, int(getattr(opt, 'conf_min_views', 2)))
+        conf_mask = ((self.conf_view_count.reshape(-1) >= min_views)
+                     & (self.conf_norm_sum.reshape(-1) > 0)
+                     & torch.isfinite(self.conf_norm_sum.reshape(-1))
+                     & torch.isfinite(self.conf_world_sum).all(dim=-1)
+                     & torch.isfinite(conf)
+                     & (conf >= getattr(opt, 'conf_thr', 0.85)))
         if scores is None:
             selection_score = conf.clone()
         else:

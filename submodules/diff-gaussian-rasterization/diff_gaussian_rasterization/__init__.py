@@ -252,9 +252,11 @@ class GaussianRasterizer(nn.Module):
         )
 
 
-def accumulate_conf(samples, world_sum, norm_sum, view_count, conf_out):
-    """Update the detached streaming Conf statistic on the CUDA current stream."""
-    return _C.accumulate_conf(samples, world_sum, norm_sum, view_count, conf_out)
+def accumulate_conf(samples, camera_id, history, camera_ids, view_count,
+                    world_sum, norm_sum, conf_out):
+    """Refresh each Gaussian's detached recent-view history on the CUDA stream."""
+    return _C.accumulate_conf(samples, camera_id, history, camera_ids,
+                              view_count, world_sum, norm_sum, conf_out)
 
 
 def _require_default_stream(tensor):

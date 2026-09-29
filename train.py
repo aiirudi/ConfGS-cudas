@@ -119,7 +119,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
 
         conf_camera_key = int(viewpoint_cam.uid)
         conf_holder = ({} if opt.densify_from_iter < iteration < opt.densify_until_iter
-                       and conf_camera_key not in gaussians.conf_camera_keys else None)
+                       else None)
         conf_topology_version = gaussians.conf_topology_version
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, conf_stats=conf_holder)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -181,7 +181,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
             # Densification
             if opt.densify_from_iter < iteration < opt.densify_until_iter:
 
-                # --- Conf timing probe ---
+                # --- Conf window-update timing probe; sample generation runs
+                # inside loss.backward() above and is not included here. ---
                 if opt.profile_components:
                     torch.cuda.synchronize()
                     start_conf = torch.cuda.Event(enable_timing=True)
@@ -329,8 +330,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                         rfas_score=gaussian_importance_rf,
                         vis_context=vis_context,
                     )
-                    # A densification interval ends even when no point was split.
-                    gaussians.reset_conf_window()
 
                     # 候选选择统计日志
                     if getattr(opt, 'candidate_stats_enabled', True):

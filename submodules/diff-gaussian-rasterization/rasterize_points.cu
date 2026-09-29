@@ -246,7 +246,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
   torch::Tensor conf_samples = collect_conf
-      ? torch::zeros({P, 4}, means3D.options().dtype(torch::kFloat32))
+      ? torch::full({P, 4}, -1.0, means3D.options().dtype(torch::kFloat32))
       : torch::empty({0}, means3D.options().dtype(torch::kFloat32));
   
   if(P != 0)

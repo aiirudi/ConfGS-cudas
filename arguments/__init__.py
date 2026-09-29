@@ -124,6 +124,7 @@ class OptimizationParams(ParamGroup):
 
         # Conf parameter
         self.conf_min_views = 2
+        self.conf_window_size = 3
         self.conf_thr = 0.85
 
         # ---- 候选点选择策略参数 ----

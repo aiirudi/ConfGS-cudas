@@ -39,10 +39,10 @@ Before installing our project, you need to ensure that your local environment fo
 Clone the repository
 
 ```
-git clone https://github.com/XiaoBin2001/Imporved-GS.git
+git clone https://github.com/aiirudi/ConfGS-cudas.git
 ```
 
-Extract the compressed package of submodules.
+Use the checked-in `submodules/` sources. Extracting an older submodule archive over them would replace the CUDA Conf rasterizer.
 
 Then, you can install the dependencies listed in `environment.yml` following the installation instructions of 3DGS. 
 
@@ -78,9 +78,13 @@ Rebuild the local rasterizer after updating this checkout:
 python -m pip install -v --no-build-isolation -e submodules/diff-gaussian-rasterization
 ```
 
-Training now uses `conf_only` by default. A Gaussian is eligible for LAS when its CUDA Conf score reaches `--conf_thr` and it has at least `--conf_min_views` distinct informative training cameras. The existing EAS and RFAS computations and their fused ranking score still determine which eligible Gaussian is sampled first. Legacy candidate strategies (`and`, `or`, `abs_only`, `weighted_score`, `soft_fusion`, `rfas_rank`) raise an explicit error in the CUDA Conf training path because they depend on or bypass the new gate; use `--candidate_selection_strategy conf_only`. For fixed candidate budgets, choose `fixed_number` or `fixed_ratio`; `match_and` depends on the removed abs-gradient gate.
+The CUDA extension source is `submodules/diff-gaussian-rasterization/`. The current CUDA Conf build was validated with PyTorch 2.1.2 and CUDA 11.8 in the `pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel` image; the repository's older `environment.yml`/Dockerfile pins are retained for existing deployments and may require their own compatibility check.
 
-Conf collects the first backward observation for each camera ID within each densification interval. Zero or invalid per-Gaussian gradients do not count as views. A later visit to the same camera in that interval is ignored, even if a Gaussian became visible later. The window resets at each densification boundary or topology reset. The state uses float32 vector, norm, and score plus int32 view count (24 bytes per Gaussian), with a transient 16-byte sample when collection is enabled. CUDA Conf is a detached density statistic; optimization still uses the real loss gradients. The rasterizer currently requires the CUDA default stream; its Python wrapper reports an error on another stream.
+For GPU-less Docker builds, the Dockerfile defaults to `TORCH_CUDA_ARCH_LIST=8.0+PTX` (A100 and compatible later GPUs). Override it with `docker build --build-arg TORCH_CUDA_ARCH_LIST="..."` for a different target architecture.
+
+Training now uses `conf_only` by default. A Gaussian is eligible for LAS when its CUDA Conf score reaches `--conf_thr`, its norm sum is positive, and it has at least `--conf_min_views` distinct visible training cameras in its recent-view window. The default `--conf_window_size` is 3; choose `2 <= conf_min_views <= conf_window_size`. The existing EAS and RFAS computations and their fused ranking score still determine which eligible Gaussian is sampled first. Legacy candidate strategies (`and`, `or`, `abs_only`, `weighted_score`, `soft_fusion`, `rfas_rank`) raise an explicit error in the CUDA Conf training path because they depend on or bypass the new gate; use `--candidate_selection_strategy conf_only`. For fixed candidate budgets, choose `fixed_number` or `fixed_ratio`; `match_and` depends on the removed abs-gradient gate.
+
+Each Gaussian retains its most recent distinct cameras that actually contributed pixels. A visible zero-gradient observation occupies a slot; an invisible or invalid observation leaves that Gaussian's history unchanged. Revisiting a camera refreshes its slot, and a new camera evicts the oldest slot when the window is full. Histories persist across densification intervals and follow surviving Gaussians through pruning; new split rows start empty. Observations still come from different training steps, so the window is not a frozen-model comparison. At window size 3, the resident state uses about 96 bytes per Gaussian, plus a transient 16-byte sample when collection is enabled. CUDA Conf is a detached density statistic; optimization still uses the real loss gradients. The rasterizer currently requires the CUDA default stream; its Python wrapper reports an error on another stream.
 
 ## Parameters
 

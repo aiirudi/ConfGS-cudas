@@ -1,0 +1,7 @@
+submodules/**/build/
+submodules/**/*.so
+submodules/**/*.o
+submodules/**/*.egg-info/
+__pycache__/
+*.pyc
+*.zip

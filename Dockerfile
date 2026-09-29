@@ -14,14 +14,14 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.s
     && rm /tmp/miniconda.sh
 ENV PATH=$CONDA_DIR/bin:$PATH
 
-# Build the conda env and compile the three CUDA extensions.
-# environment.yml's pip section references relative paths under submodules/,
-# so the unzipped sources must sit next to it at conda-env-create time.
+# Build the conda env and compile the three CUDA extensions from this checkout.
+# environment.yml's pip section references these relative source paths.
 WORKDIR /build
 COPY environment.yml /build/environment.yml
-COPY submodules-speedy.zip /build/submodules-speedy.zip
-RUN unzip -q /build/submodules-speedy.zip -d /build/ \
-    && conda env create -f /build/environment.yml -n rfgs \
+COPY submodules/ /build/submodules/
+ARG TORCH_CUDA_ARCH_LIST="8.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+RUN conda env create -f /build/environment.yml -n rfgs \
     && conda clean -afy \
     && rm -rf /build
 

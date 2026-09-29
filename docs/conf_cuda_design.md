@@ -1,108 +1,128 @@
-# CUDA multi-view Conf design
+# CUDA Conf: per-Gaussian rolling multi-view window
 
-## Scope and invariant
+## Revised requirement
 
-Replace the training densification signal and its accumulation with CUDA Conf. Preserve rendering, photometric/PAIR losses, parameter gradients, optimizers, LAS geometry, pruning policy, EAS, RFAS, and EAS/RFAS fusion. Existing uncommitted changes in `arguments/__init__.py`, `test.py`, and `train.py` belong to the user and must be preserved.
+This document supersedes the original interval-wide accumulation design. The user requires `--conf_window_size W`, default **3**, to hold each Gaussian's most recent W distinct **actually visible** camera observations. The fourth new valid view at W=3 evicts that Gaussian's oldest gradient. Global training-camera visits do not advance a Gaussian's window when it does not contribute to the rendered image.
 
-“Change backward to Conf” means computing the densification statistic during the rasterizer backward pass. A scalar conflict score cannot replace `dL/dxyz`, `dL/dopacity`, or other derivatives: it has neither their dimensions nor their direction. The actual optimization gradient remains the derivative of the actual loss. Conf is a detached side-channel produced by backward and consumed after backward.
+Conf replaces abs-gradient densification statistics, not real loss derivatives. Preserve rendering, photometric/PAIR losses, optimizer gradients, EAS, RFAS, EAS/RFAS fusion, LAS geometry, and pruning policy. Existing user modifications remain intact.
 
-## Existing implementation and exact coordinates
+## Projection gradient and actual visibility
 
-The current chain is `train.py: loss.backward()` → `add_densification_stats_abs()` → Python `_compute_ndc_vjp_world()` → vector/norm accumulation → `densify_and_prune_Improved()` → candidate selector → LAS.
+The signed `dL_dmean2D.x/y` values in `PerGaussianRenderCUDA` already include image W/2 and H/2 and therefore represent NDC derivatives. Remove the separate `fabs` sums and z/w abs atomics, but preserve signed x/y accumulation. Retaining unused zero z/w channels is an acceptable ABI simplification.
 
-`PerGaussianRenderCUDA` accumulates signed pixel contributions in `dL_dmean2D.x/y`; the extra `.z/.w` channels sum `fabs(tmp_x/y)` for AbsGS. The x/y values **already include W/2 and H/2** and are derivatives with respect to NDC coordinates, not pixel coordinates. Applying another focal-length or image-size factor would double-scale them.
-
-`backward.cu::preprocessCUDA` already computes the required pure projection pullback in local variable `dL_dmean`, before adding it to `dL_dmeans` and before SH derivatives. Export that local value. Do not use final `means3D.grad`: it also contains covariance and SH contributions, unlike the intended Conf statistic.
-
-PyTorch camera matrices use row-vector convention: `q = [xyz,1] @ full_proj_transform`. CUDA reads the same memory using `transformPoint4x4`. For `r = 1 / (q.w + 1e-7)` the **existing renderer's** exact projection Jacobian is:
+Export local `dL_dmean` from `preprocessCUDA`, before its addition to the final position derivative and before SH derivatives. Do not substitute final `means3D.grad`, which also contains covariance/SH contributions. For row-vector camera convention `q = [xyz,1] @ M`, the existing renderer uses `r=1/(q.w+1e-7)` and:
 
 ```
-jx[k] = M[k,0] * r - M[k,3] * q.x * r*r
-jy[k] = M[k,1] * r - M[k,3] * q.y * r*r
-g_world[k] = jx[k] * g_ndc.x + jy[k] * g_ndc.y
+jx[k] = M[k,0]*r - M[k,3]*q.x*r*r
+jy[k] = M[k,1]*r - M[k,3]*q.y*r*r
+g_world[k] = jx[k]*g_ndc.x + jy[k]*g_ndc.y
 ```
 
-Copying the existing CUDA intermediate is preferable to re-deriving a slightly different projection: the old Python helper omits the renderer's `+1e-7`. The forward projection itself must not change. Tests must use the renderer's actual stabilized projection when comparing exact derivatives.
+Reuse this intermediate rather than re-deriving the Python Jacobian, which previously omitted stabilization. Do not double-apply focal/image scaling. All actual parameter derivatives remain unchanged.
 
-## Multi-view statistic and validity
+**A visible zero gradient is a valid view.** Use actual rasterization participation independent of derivative magnitude. In backward render, after the existing valid-pixel, last-contributor, power, and alpha checks, set a register boolean indicating an accepted contributing pixel. At bucket completion, mark participation only when this boolean is true. A positive radius is not sufficient evidence: the Gaussian may be fully occluded or rejected everywhere.
 
-For Gaussian i and distinct eligible camera c, let `g_ic` be the signed world-space projection gradient from that camera's training backward. Maintain sufficient statistics:
+Inspection confirms forward `accum_count`/`accum_blend` are updated only inside `if(pixel_weights != nullptr)` and are allocated only for weighted rendering. They cannot describe ordinary training visibility. Do not enable artificial pixel weights or alter RFAS to obtain visibility.
 
-```
-S_i = sum_c g_ic                 # float32 (N,3)
-M_i = sum_c norm(g_ic)           # float32 (N,1)
-K_i = number of valid cameras   # int32   (N,1)
-Conf_i = clamp(1 - norm(S_i)/M_i, 0, 1)
-```
+Keep the auxiliary output shape `(P,4)` and use its norm channel as a two-stage marker:
 
-Set Conf to zero if `K < 2`, `M <= 0`, or any necessary statistic is nonfinite. Candidate validity also requires `K >= conf_min_views`. Preserve the user's `conf_min_views=2` and `conf_thr=0.85`; use `>=` for the threshold.
+1. Initialize `.w=-1`, meaning invalid/unseen; xyz is ignored while w is negative.
+2. Backward render receives an optional `float4* conf_samples`. Each bucket with an accepted contributing pixel performs `atomicExch(&conf_samples[i].w, 0.0f)` at its end.
+3. Subsequent preprocess checks w>=0, positive finite clip-w, finite VJP and finite stable norm, then writes `(g_world.xyz, norm)`. **norm=0 is valid.** Invalid projection/VJP restores w=-1.
+4. Sequential kernel ordering on the same stream completes all markers before sample conversion. This avoids an additional visibility buffer and leaves RFAS forward untouched.
 
-Do not compute `1 - norm(S)/(M+1e-6)`: this biases small coherent gradients toward Conf=1. Guard division instead of perturbing a positive denominator. Zero vectors contain no directional evidence and must not increment K. This fixes the existing zero-gradient false-positive case.
+Use stable `hypotf` norms. NaN/Inf derivatives cannot supply a usable sample and do not advance history even if the primitive was nominally rendered. This invalid-norm sentinel is internal API metadata, not a mathematical negative norm.
 
-A sample is valid only for `radii > 0`, positive finite clip-w above the existing validity floor (1e-8), finite signed gradients and finite positive world norm. A frustum-visible but fully occluded Gaussian normally has zero derivative and is excluded naturally. Use `hypotf`-style stable norm calculation to avoid overflow from directly squaring large finite components. CUDA initializes all output rows to zero; invalid or skipped rows remain zero. Accumulation must reject nonfinite sample values, and score finalization must fail closed for nonfinite sums. No arbitrary gradient clipping is needed.
+## Per-Gaussian window semantics
 
-The formula is the existing **magnitude-weighted directional cancellation** statistic in a common coordinate frame. It is invariant to a common positive loss scaling, bounded, and gives 0 for aligned gradients, 1 for exactly cancelling equal opposite gradients, and `1 - sqrt(2)/2` for equal orthogonal gradients. It does not claim to eliminate dependence on unequal gradient magnitudes: those magnitudes intentionally represent relative optimization pressure. Unit-normalizing each view would change the method and existing threshold meaning, amplify tiny noisy observations, and is not the default.
+Each Gaussian owns an ordered bounded list, oldest to newest, of `(camera_id,g_world.xyz,norm)`. Camera IDs are stable nonnegative int64 dataset view IDs; -1 means an unused slot. They must identify the view image, not a shared COLMAP intrinsic-camera model.
 
-## Distinct-camera streaming policy
+For a valid sample of Gaussian i from camera c:
 
-Recommended default: retain the current randomized training-camera traversal, and admit **only the first backward observation from each camera within a densification interval**. A Python set of camera keys is sufficient. Every admitted observation increments K only where its per-Gaussian sample is valid. Thus K counts distinct informative cameras, never iterations, tiles, pixels, or repeated renders.
+- If c is already in its window, remove that old entry and append the new observation at the newest end. Count does not change. This updates both gradient and recency.
+- If c is absent and the window is full, evict the oldest entry and append the new observation. The old gradient/norm is no longer included in either sum.
+- If c is absent and there is capacity, append and increment occupied count.
+- An invalid/unseen sample does nothing: no eviction, refresh, count change, or decay.
 
-Use the training camera's stable `uid`, or an explicit dataset index assigned once, as the key. Do not use only the last camera id: repeats may be nonconsecutive. Do not use the RFAS `camlist` length as the view count. Repeated backward on the same render and repeated training-camera visits must not inflate K. RFAS/EAS/inference renders must never enter this accumulator.
+At W=3, `A,B,C,D → B,C,D`, `A,B,C,A → B,C,A`, `A,unseen-B,unseen-C,D → A,D`. Each Gaussian can retain a different history for the same global camera sequence. Repeated cameras cannot inflate distinct-view count. Visible zero vectors consume/refresh slots and can evict nonzero observations, as required by visibility-based window semantics.
 
-This costs O(N) GPU memory plus O(V_interval) CPU set entries; no per-camera N-vector cache, N×V bitset, all-view rerender, extra loss backward, or per-Gaussian Python loop is needed. Existing training samples cameras without replacement within an epoch, so repeats mainly arise across epoch boundaries or small datasets. Deduplication also prevents conflicting gradients from different training times of one camera from falsely counting as cross-view evidence.
+Recommend a compact ordered deque instead of a circular buffer plus cursor: W=3 requires at most two slot moves and duplicate-camera refresh naturally preserves order. A literal ring is also valid if it implements identical refresh/eviction semantics. Window semantics matter more than physical layout.
 
-Tradeoffs must be documented honestly. Statistics combine observations from nearby training steps, not a frozen model snapshot; a short densification interval limits but does not eliminate temporal drift. First-observation deduplication intentionally ignores a later valid sample if that Gaussian was invisible or had zero gradient on the first visit to the same camera. Recovering those samples exactly would require per-Gaussian per-camera state. Likewise, distinct camera IDs can still have highly correlated poses. This is an efficient, well-defined default, not a proven global optimum over datasets. Frozen multi-view probing, pose clustering, reservoirs, per-camera replacement, and pairwise conflict matrices add cost or change the statistic and are deferred until measurements justify them.
+No global camera set remains. Every eligible training render may refresh some Gaussian's history and must collect samples. Evaluation, EAS and RFAS renders never advance the Conf window.
 
-Do not dynamically lower `conf_min_views` for a one-camera dataset. Such a dataset cannot provide multi-view conflict evidence; no Conf candidates is the correct result.
+## Formula and numerical stability
 
-## CUDA and Python interfaces
-
-1. Extend rasterizer backward with an optional auxiliary Conf sample output `conf_samples` of shape `(N,4)`, float32, CUDA, contiguous. Columns are `(g_world.x, g_world.y, g_world.z, norm(g_world))`; a zero fourth column denotes invalid/no directional evidence. An empty tensor denotes disabled collection. `preprocessCUDA` writes the sample from its existing local `dL_dmean` without changing any real gradient. Thread the pointer through `backward.h`, `rasterizer.h`, `rasterizer_impl.cu`, `rasterize_points.h/.cu`, and the Python backward unpacking consistently.
-
-2. Remove `fabs` register sums and atomics in `PerGaussianRenderCUDA`. Preserve x/y signed accumulation exactly. Retaining a `(N,4)` temporary screen-gradient buffer with zero z/w is an acceptable ABI simplification; those columns must no longer be consumed as abs-grad. Do not place Conf into x/y or into the real means3D gradient. Compacting all means2D buffers to float2 is optional and carries a larger ABI surface.
-
-3. Expose a pybind CUDA operation such as:
+For the occupied window H_i:
 
 ```
-accumulate_conf(samples, world_sum, norm_sum, view_count, conf_out)
-    -> conf_out
+S_i = sum(g_is for s in H_i)
+M_i = sum(norm(g_is) for s in H_i)
+K_i = occupied distinct-camera count
+Conf_i = clamp(1 - norm(S_i)/M_i, 0, 1) if K_i>=2 and M_i>0
+Conf_i = 0 otherwise
 ```
 
-All tensors are detached. The operation validates CUDA device, float32/int32 dtype, contiguous layout, exact matching N and channel dimensions, and rejects unexpected storage aliasing. One thread per Gaussian updates S/M/K and writes current Conf; it needs no atomics because observations are submitted serially on the same stream. It does not reset the state. Alternatively split update and finalize kernels, computing Conf only at densification. Both satisfy the requirement that Python consumes CUDA-computed Conf directly. Use PyTorch current device/stream for the new operations, launch-error checks, and an early empty-N return. Explicitly test or document the inherited rasterizer's default-stream limitation; do not introduce a falsely safe asynchronous combination of default-stream producers and current-stream consumers.
+The candidate gate requires finite score and positive finite M, `K >= max(2,conf_min_views)`, and `Conf >= conf_thr`. Preserve the user's defaults `conf_min_views=2`, `conf_thr=0.85`. Validate W>=2 and `2 <= conf_min_views <= W`. Capacity and minimum evidence are different options.
 
-4. Use an explicit auxiliary holder to cross the autograd boundary. For example `render(..., conf_stats=holder)` passes an optional non-tensor dictionary/object into `_RasterizeGaussians.apply`; its backward stores the CUDA-returned sample in `holder['samples']`. The backward returns `None` for that auxiliary input. `render_pkg['conf_stats']` points to the holder; the sample is available only after `loss.backward()`. Keep the holder on `ctx`, not as global module state. This permits two outstanding renders without one overwriting the other and avoids pretending a statistic is a derivative. Existing renderer outputs and ordinary `viewspace_points.grad` remain compatible apart from removed abs channels. Handle optional input arity consistently across direct rasterizer callers. Enable collection only for training renders within the accumulation range and, preferably, only for unseen camera IDs. Debug and non-debug paths must unpack the same backward tuple; the current debug forward incorrectly unpacks 7 of 19 outputs and should be corrected when touching that wrapper.
+Do not perturb positive M with `+1e-6`: this makes tiny aligned vectors falsely appear conflicting. Guard division instead. One nonzero vector plus visible zero vectors has Conf=0; an entirely zero window never qualifies because M must be positive. At explicitly requested `conf_thr=0`, a nonzero but coherent window may qualify: zero threshold intentionally removes the conflict-strength requirement. No extra nonzero-direction counter is necessary.
 
-5. `GaussianModel.add_conf_stats(samples, camera_key)` checks deduplication and calls the CUDA accumulator, then records the key. Keep state member naming explicit (`conf_world_sum`, `conf_norm_sum`, `conf_view_count`, `conf_score`) or provide documented aliases if visualization requires old names. The production training path must not call Python `_compute_ndc_vjp_world` or read abs-grad. The helper can remain solely as a numerical reference; legacy explicitly invoked APIs must fail clearly or route to the new path rather than silently fall back to old accumulation.
+Long-running `sum -= old; sum += new` updates accumulate cancellation drift. After editing the small history, recompute S/M from its at most W active slots, optionally using double temporaries. This is exactly equivalent to removing expired gradients, numerically stable, and O(W); camera-ID search already costs O(W). Do not preserve stale aggregate errors to claim O(1) updates.
 
-## Selection and RFAS preservation
+Retain the existing magnitude-weighted world-space cancellation formula. Unit-normalizing each view changes the method and threshold meaning. Aligned gradients give 0, equal opposite gradients give 1, equal orthogonal gradients give `1-sqrt(2)/2`. Common positive loss rescaling leaves the ideal score unchanged.
 
-The default selection becomes `conf_only`: `base_mask = (CUDA_conf >= conf_thr) & (valid_view_count >= conf_min_views)`, with any required finite checks. Pass this mask into the existing LAS and optional spatial-diversity machinery. RFAS/EAS/fusion values remain the existing sampling/ranking scores inside eligible candidates. Preserve `compute_rf_score1`, its `pixel_weights` forward mechanism, `compute_high_freq_residual_log`, `compute_edge_score`, and `fuse_importance_scores` unchanged. `abs-grad` is unrelated to RFAS's forward pixel weighting and is not needed by it.
+## State and interface
 
-Remove the special `iteration > 14500` fallback to gradient magnitude and the old abs threshold relaxation. Late iterations continue using Conf eligibility and the normally supplied ranking scores. If the caller supplies no ranking score, use Conf itself as a documented fallback; do not resurrect abs-grad.
+P is Gaussian count; W is window capacity.
 
-Avoid silently relabeling Conf as abs-grad in compatibility logs or candidate strategies. Keep the general selector's old strategy implementations for existing isolated tests/explicit legacy utilities if useful, but the CUDA Conf production route needs a clear Conf-only selector/branch with no `abs_score`, `abs_mask`, `densify_grad_threshold`, `match_and`, or finite-mask dependency on obsolete buffers. Reject explicitly requested incompatible abs-dependent strategies with an actionable error, or offer an explicit documented legacy mode; do not compute abs-grad to preserve them invisibly. RFAS-only ranking as a legacy ablation should not become the default or bypass the new Conf eligibility accidentally.
+| State | Shape | Type |
+|---|---|---|
+| history, ordered world xyz/norm | P,W,4 | float32 |
+| camera IDs, unused=-1 | P,W | int64 |
+| occupied view count | P,1 | int32 |
+| world sum | P,3 | float32 |
+| norm sum | P,1 | float32 |
+| CUDA Conf score | P,1 | float32 |
+| transient backward sample | P,4 | float32 |
 
-Fixed budgets and spatial selection must remain subsets of the Conf candidate mask. A requested budget may exceed the available candidates; never fill it with non-Conf points. Use `.reshape(-1)` or `.squeeze(-1)` rather than unconstrained `.squeeze()` so N=1 stays one-dimensional. Empty candidate sets should be a clean no-op. Keep existing split/prune/budget geometry and score semantics.
+The optional non-tensor holder passed into custom autograd receives the native backward output as `holder['samples']`; backward returns None for that auxiliary input. `render_pkg['conf_stats']` references that holder. Read it only after `loss.backward()`. Do not disguise a statistic as a parameter derivative or use a shared global holder.
 
-## State, topology, and checkpoints
+The CUDA operation is conceptually:
 
-Centralize Conf window reset. Initialize on `training_setup`; clear at **every** densification boundary, including no candidates, zero budget, and no split. The current code only resets via successful topology extension, which can leak statistics across nominal intervals. Reset the camera-key set whenever sums are reset. Capture visualization/statistics before resetting.
+```
+update_conf_window(samples, camera_id, history, camera_ids,
+                   world_sum, norm_sum, view_count, conf_score)
+    -> conf_score
+```
 
-For pure pruning within an open interval, slice all N-dependent buffers with the same survivor mask and preserve the admitted-camera set. Alternatively deliberately reset the entire window, but never reset just the set while retaining sums. `only_prune`, split/clone append, topology replacement, and loading a new model should reset all buffers and the set together. New Gaussian rows start at zero. If a topology reset occurs after rendering but before accumulation, discard that render's sample: N equality alone is insufficient when topology identities have changed. The existing step-300 prune occurs outside the default Conf range, but custom ranges must be safe.
+One thread owns one Gaussian's history, so window updates require no atomics. Validate dtype, device, contiguous shape, matching P/W, valid camera ID, and unsafe aliases. Empty P is a no-op. Preserve correct producer/consumer stream ordering; a current-stream accumulator cannot safely consume unsynchronized default-stream rasterizer outputs. Reject samples belonging to a previous topology generation even if P coincidentally matches.
 
-Recommended checkpoint extension: retain the historical 12 fields and append a versioned optional Conf-state dictionary containing S/M/K, any cached Conf score, admitted stable camera keys, and version. Restore both legacy length-12 and new payloads. Never reinterpret old `xyz_gradient_accum` or `denom` as Conf. Legacy checkpoints initialize an empty Conf window; new checkpoints preserve a mid-interval window. Validate restored shapes/dtypes/device and recompute score if it is not saved. If an implementation instead deliberately omits transient stats, explicitly reset all new state on resume and document that mid-interval resume is not selection-equivalent. PLY format remains unchanged.
+## Lifecycle and checkpoint
 
-## Verification and acceptance
+**Never reset survivor history merely because a densification interval ended**, including zero-budget/no-split boundaries. This is a continuous rolling history. A Gaussian not seen for many renders retains its own last W effective observations.
 
-Tests must be run using the requested testing model, and evaluated by the requested independent review model. CUDA compilation alone is not acceptance.
+Pure pruning and `only_prune` slice every state buffer with the same survivor mask. Split/clone append initializes only new rows to zero with IDs=-1; unchanged old rows retain history. Deleted parents disappear via the same prune mask. Descendants do not inherit parent history because their geometry changes. If a split mutates an existing row's geometry in place, invalidate that row only. Initialization, a new PLY model, deliberate capacity changes, and legacy checkpoint migration start empty history. Keep a topology generation guard for stale render outputs.
 
-* **Formula/invalid cases:** CUDA vs independent float64 reference for aligned, opposite, orthogonal, unequal-magnitude, very small coherent, common loss-rescaling, zero, NaN/Inf, invisible, behind-camera, empty-N, N=1, and randomized streams. Typical float32 checks: abs/rel tolerance around 1e-5 outside degenerate scales, with separate absolute checks near zero. Verify clamp range and zero-count behavior.
-* **Projection correctness:** compare emitted CUDA samples against the standalone exact stabilized projection VJP and finite differences for non-square images, translated/rotated cameras and positive depths. Validate roll/frame consistency using covariantly transformed screen gradients. Do not compare to the whole `xyz.grad`.
-* **Real backward invariance:** fixed small scene, fixed upstream image tensor: forward image and all real parameter gradients match the baseline with Conf enabled/disabled within GPU float32 reduction tolerances. Include SH and precomputed-color/covariance modes supported by the existing API; separate failures due to pre-existing unsupported combinations.
-* **No abs dependence:** no `fabs(tmp_x/y)` accumulation remains; train uses only CUDA Conf stats. Perturbing old dummy z/w gradients or `densify_grad_threshold` cannot change new candidates. Above iteration 14500 the same Conf gate remains active.
-* **Distinct multiview:** A,A,B and A,B,A equal A,B for stats and K, including nonconsecutive repeats and cameras with only some valid Gaussian rows. Same camera with opposite gradients must not by itself qualify as multiview. Independent holders must not cross-contaminate.
-* **Lifecycle:** no-split boundary reset, budget-zero reset, prune masking, split/new rows, one-camera dataset, interval reset of dedup keys, legacy checkpoint restore, and new mid-window checkpoint round trip.
-* **Ranking regression:** synthetic fixed EAS/RFAS scores unchanged; final eligibility follows only Conf, rank weights preserve current score computation, fixed budget/spatial masks stay subsets, and low/high RFAS values do not modify the Conf statistic.
-* **End-to-end GPU:** build the local extension, run a short real-data training job using a scene under `/home/xzh/xzh/data/3dgs` through multiple densification boundaries, observe finite losses/Conf/counts and actual eligible splits where data produces them, save/restore a checkpoint and render. Do not claim a naturally empty high-threshold split set proves split plumbing; use a controlled low threshold test separately. Run with debug enabled at least once. Record exact commands, extension source location, device, scene, iteration range, outcomes, wall time and peak memory. A short smoke test cannot establish final PSNR superiority or an optimal threshold.
+Append a version-2 optional Conf-state dictionary to the historical twelve checkpoint fields. Save W/history/IDs/count and sums/score, or recompute aggregates after restore. Version-2 resume at unchanged capacity preserves the exact next eviction. Legacy twelve-field and version-1 cumulative states cannot reconstruct window entries, so load model/optimizer and initialize an empty rolling history. Never reinterpret old cumulative sums as history entries. A saved/requested W mismatch must explicitly reset with a message or reject, not silently reinterpret shapes. PLY remains unchanged.
 
-Performance expectation is removal of two abs register sums and atomic adds per Gaussian/tile, elimination of Python Jacobian/masking temporaries, and one O(N) streaming kernel per unique view. State uses approximately 24 bytes/Gaussian with float32 S/M/score and int32 count, plus a transient 16-byte sample. No N×V storage or extra image backward. Measure synchronized CUDA-event timings before claiming a speedup; rasterization and RFAS passes may dominate total training time.
+## Selection and RFAS invariants
+
+Python selects directly from CUDA score/count/norm validity. No production Python Jacobian or Conf recomputation; no abs mask, old gradient threshold, or >14500 fallback. Default is `conf_only`. Reject incompatible abs-dependent strategies clearly rather than restoring abs accumulation silently.
+
+Within eligible candidates preserve existing EAS/RFAS/fused scores as LAS ranking/sampling weights. Keep `compute_rf_score1`, forward `pixel_weights`, high-frequency transforms, edge scoring, and fusion unchanged. A caller without ranking scores may use a documented Conf fallback. Fixed-budget/spatial-diversity selection remains a subset of Conf eligibility. Keep P=1 tensor dimensions and empty-set behavior valid. Logging must describe a rolling window rather than interval accumulation.
+
+## Validation
+
+Requested roles remain 6astra high design, 6sol xhigh implementation, 6luna xhigh testing, and 6astra medium acceptance judgment. Compilation is only one check.
+
+- Compare CUDA state after every observation to an independent Python bounded ordered-camera reference, at W=2,3,5. Cover fourth-view eviction, duplicate refresh/recency, independently unseen rows, late visibility, and long repeated sequences.
+- Verify actual-participation marker against controlled rendering: radius-positive but fully rejected/occluded Gaussian does not advance; genuinely rendered Gaussian with zero upstream image gradient does advance with zero vector. Include clipping and partial tiles.
+- Check aligned/opposite/orthogonal/unequal/tiny vectors, common scaling, all-zero visible windows, invalid inputs, P=0/P=1, score bounds, long-run eviction drift, threshold-zero behavior, and positive-norm gating.
+- Compare emitted projection gradient with an independent exact stabilized VJP and finite differences for rotated/translated cameras, non-square images and roll. Do not compare to the complete xyz derivative.
+- Compare forward images and all actual parameter derivatives against baseline and Conf-off results within appropriate float32 GPU reduction tolerance.
+- Verify no-split/budget-zero boundaries preserve history; unrelated splits preserve survivors; pruning slices exact rows; children start empty; stale topology samples are rejected; version-2 checkpoint preserves next eviction; old states migrate empty.
+- Confirm RFAS/EAS/fusion values are unchanged, Conf controls eligibility throughout training, budgets never add ineligible points, and old abs thresholds have no influence.
+- Build and run GPU training on a scene under `/home/xzh/xzh/data/3dgs` across multiple densification boundaries. Record finite losses, counts<=W, populated histories, splitting or controlled threshold-zero smoke, checkpoint restore and rendering. Exercise debug mode. Report commands/device/build paths and distinguish synthetic correctness, smoke success, and unmeasured final PSNR/performance.
+
+Resident state uses approximately `(24*W+24)` bytes per Gaussian, plus transient 16-byte samples: W=3 is about 96 MB resident per million Gaussians. This bounded O(PW) memory enables exact per-Gaussian eviction independently of dataset camera count. Work is O(PW), with W=3 by default and no additional image backward or Python per-Gaussian loop. Measure performance before asserting speedup.
+
+This implements the user's precise sliding-view definition; it is not a proof of globally optimal reconstruction quality. Samples come from different parameter-update times, so temporal drift remains possible. Rarely visible Gaussians retain old observations by definition. Distinct camera IDs may have correlated poses. Frozen-model probing, expiration by wall time, pose clustering and normalized-direction alternatives change semantics or cost and are not introduced implicitly.

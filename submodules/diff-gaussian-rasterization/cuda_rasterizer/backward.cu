@@ -389,12 +389,15 @@ __global__ void preprocessCUDA(
 
 	// Conf observes only the projection path. The optimization gradient below
 	// must still include the covariance and SH paths.
-	if (conf_samples != nullptr && isfinite(m_hom.w) && m_hom.w > 1e-8f &&
-		isfinite(dL_dmean2D[idx].x) && isfinite(dL_dmean2D[idx].y))
+	if (conf_samples != nullptr && conf_samples[idx].w >= 0.0f)
 	{
 		float magnitude = hypotf(hypotf(dL_dmean.x, dL_dmean.y), dL_dmean.z);
-		if (isfinite(magnitude) && magnitude > 0.0f)
+		if (isfinite(m_hom.w) && m_hom.w > 1e-8f &&
+			isfinite(dL_dmean2D[idx].x) && isfinite(dL_dmean2D[idx].y) &&
+			isfinite(magnitude))
 			conf_samples[idx] = make_float4(dL_dmean.x, dL_dmean.y, dL_dmean.z, magnitude);
+		else
+			conf_samples[idx].w = -1.0f;
 	}
 
 	// That's the second part of the mean gradient. Previous computation
@@ -429,6 +432,7 @@ PerGaussianRenderCUDA(
 	const float* __restrict__ pixel_colors,
 	const float* __restrict__ dL_dpixels,
 	float4* __restrict__ dL_dmean2D,
+	float4* __restrict__ conf_samples,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors
@@ -484,6 +488,7 @@ PerGaussianRenderCUDA(
 	float Register_dL_dconic2D_w = 0.0f;
 	float Register_dL_dopacity = 0.0f;
 	float Register_dL_dcolors[C] = {0.0f};
+	bool contributed = false;
 	
 	// tile metadata
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -567,6 +572,7 @@ PerGaussianRenderCUDA(
 			const float G = exp(power);
 			const float alpha = min(0.99f, con_o.w * G);
 			if (alpha < 1.0f / 255.0f) continue;
+			contributed = true;
 			const float dchannel_dcolor = alpha * T;
 	        const float one_minus_alpha_reci = 1.0f / (1.0f - alpha);
 
@@ -608,6 +614,8 @@ PerGaussianRenderCUDA(
 
 	// finally add the gradients using atomics
 	if (valid_splat) {
+		if (contributed && conf_samples != nullptr)
+			atomicExch(&conf_samples[gaussian_idx].w, 0.0f);
 		atomicAdd(&dL_dmean2D[gaussian_idx].x, Register_dL_dmean2D_x);
 		atomicAdd(&dL_dmean2D[gaussian_idx].y, Register_dL_dmean2D_y);
 
@@ -711,6 +719,7 @@ void BACKWARD::render(
 	const float* pixel_colors,
 	const float* dL_dpixels,
 	float4* dL_dmean2D,
+	float4* conf_samples,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors)
@@ -733,6 +742,7 @@ void BACKWARD::render(
 		pixel_colors,
 		dL_dpixels,
 		dL_dmean2D,
+		conf_samples,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors

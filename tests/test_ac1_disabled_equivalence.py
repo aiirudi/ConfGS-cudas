@@ -13,6 +13,7 @@ def make_model():
     model._opacity = torch.zeros(4, 1)
     model.conf_score = torch.tensor([[0.9], [0.9], [0.95], [0.1]])
     model.conf_view_count = torch.tensor([[2], [1], [3], [4]], dtype=torch.int32)
+    model.conf_norm_sum = torch.ones(4, 1)
     model.xyz_gradient_accum = torch.ones(4, 1) * 999.0
     model.denom = torch.ones(4, 1)
     selected = []

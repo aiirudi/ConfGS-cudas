@@ -38,6 +38,7 @@ namespace BACKWARD
 		const float* pixel_colors,
 		const float* dL_dpixels,
 		float4* dL_dmean2D,
+		float4* conf_samples,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors);
