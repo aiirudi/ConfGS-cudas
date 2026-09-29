@@ -117,7 +117,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        conf_camera_key = int(viewpoint_cam.uid)
+        conf_camera_key = viewpoint_cam.conf_camera_key
         conf_holder = ({} if opt.densify_from_iter < iteration < opt.densify_until_iter
                        else None)
         conf_topology_version = gaussians.conf_topology_version
@@ -195,7 +195,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, debug_fr
                     samples = render_pkg['conf_stats'].get('samples')
                     if samples is None:
                         raise RuntimeError('CUDA backward did not produce Conf samples')
-                    gaussians.add_conf_stats(samples, conf_camera_key)
+                    gaussians.add_conf_stats(samples, conf_camera_key, conf_topology_version)
 
                 if opt.profile_components:
                     end_conf.record()

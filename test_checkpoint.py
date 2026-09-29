@@ -36,6 +36,7 @@ def main():
         raise RuntimeError('CUDA is required for this validation')
     args = training_args()
     source = make_model()
+    source.set_conf_camera_mapping({1: 'view-one', 4: 'view-four'})
     source.training_setup(args)
     source.conf_world_sum[0, 0] = 0.5
     source.conf_norm_sum[0, 0] = 1.5
@@ -48,6 +49,7 @@ def main():
     assert len(state) == 13
 
     restored = make_model()
+    restored.set_conf_camera_mapping({1: 'view-one', 4: 'view-four'})
     restored.restore(state, args)
     assert torch.equal(restored.conf_world_sum, source.conf_world_sum)
     assert torch.equal(restored.conf_norm_sum, source.conf_norm_sum)
@@ -55,6 +57,30 @@ def main():
     assert torch.equal(restored.conf_score, source.conf_score)
     assert torch.equal(restored.conf_history, source.conf_history)
     assert torch.equal(restored.conf_camera_ids, source.conf_camera_ids)
+    assert restored.conf_camera_mapping == source.conf_camera_mapping
+
+    wrong_scene = make_model()
+    wrong_scene.set_conf_camera_mapping({1: 'another-view', 4: 'view-four'})
+    try:
+        wrong_scene.restore(state, args)
+    except ValueError as error:
+        assert 'camera mapping differs' in str(error)
+    else:
+        raise AssertionError('Mismatched camera mapping was accepted')
+
+    unmapped_v2 = make_model()
+    unmapped_v2.restore(state[:12] + ({key: value for key, value in state[12].items()
+                                      if key != 'camera_mapping'},), args)
+    assert torch.all(unmapped_v2.conf_camera_ids == -1)
+
+    stale_version = restored.conf_topology_version
+    restored.reset_conf_window()  # Same Gaussian count, different history generation.
+    try:
+        restored.add_conf_stats(torch.zeros((3, 4), device='cuda'), 1, stale_version)
+    except ValueError as error:
+        assert 'stale Gaussian topology' in str(error)
+    else:
+        raise AssertionError('Stale Conf samples were accepted')
 
     legacy = make_model()
     legacy.restore(state[:12], args)

@@ -35,7 +35,7 @@ Use stable `hypotf` norms. NaN/Inf derivatives cannot supply a usable sample and
 
 ## Per-Gaussian window semantics
 
-Each Gaussian owns an ordered bounded list, oldest to newest, of `(camera_id,g_world.xyz,norm)`. Camera IDs are stable nonnegative int64 dataset view IDs; -1 means an unused slot. They must identify the view image, not a shared COLMAP intrinsic-camera model.
+Each Gaussian owns an ordered bounded list, oldest to newest, of `(camera_id,g_world.xyz,norm)`. Camera IDs are stable nonnegative int64 dataset view IDs; -1 means an unused slot. They must identify the view image, not a shared COLMAP intrinsic-camera model. The implementation hashes each training image's dataset-relative path, pose, intrinsics and dimensions; it checks duplicate identities/hash collisions and stores the complete ID-to-identity mapping in the checkpoint. Restore rejects a changed mapping. A prior v2 checkpoint without this mapping explicitly starts an empty Conf history.
 
 For a valid sample of Gaussian i from camera c:
 
@@ -96,13 +96,15 @@ update_conf_window(samples, camera_id, history, camera_ids,
 
 One thread owns one Gaussian's history, so window updates require no atomics. Validate dtype, device, contiguous shape, matching P/W, valid camera ID, and unsafe aliases. Empty P is a no-op. Preserve correct producer/consumer stream ordering; a current-stream accumulator cannot safely consume unsynchronized default-stream rasterizer outputs. Reject samples belonging to a previous topology generation even if P coincidentally matches.
 
+The model's `add_conf_stats(samples, camera_id, producer_topology_version)` requires the version captured before rendering and rejects a mismatch before calling CUDA. The native kernel requires 16-byte alignment for its `float4` sample/history accesses; a contiguous slice alone does not prove alignment.
+
 ## Lifecycle and checkpoint
 
 **Never reset survivor history merely because a densification interval ended**, including zero-budget/no-split boundaries. This is a continuous rolling history. A Gaussian not seen for many renders retains its own last W effective observations.
 
 Pure pruning and `only_prune` slice every state buffer with the same survivor mask. Split/clone append initializes only new rows to zero with IDs=-1; unchanged old rows retain history. Deleted parents disappear via the same prune mask. Descendants do not inherit parent history because their geometry changes. If a split mutates an existing row's geometry in place, invalidate that row only. Initialization, a new PLY model, deliberate capacity changes, and legacy checkpoint migration start empty history. Keep a topology generation guard for stale render outputs.
 
-Append a version-2 optional Conf-state dictionary to the historical twelve checkpoint fields. Save W/history/IDs/count and sums/score, or recompute aggregates after restore. Version-2 resume at unchanged capacity preserves the exact next eviction. Legacy twelve-field and version-1 cumulative states cannot reconstruct window entries, so load model/optimizer and initialize an empty rolling history. Never reinterpret old cumulative sums as history entries. A saved/requested W mismatch must explicitly reset with a message or reject, not silently reinterpret shapes. PLY remains unchanged.
+Append a version-2 optional Conf-state dictionary to the historical twelve checkpoint fields. Save W/history/IDs/count, sums/score and the training-camera identity mapping, or recompute aggregates after restore. Version-2 resume at unchanged capacity and matching camera mapping preserves the exact next eviction. Legacy twelve-field and version-1 cumulative states cannot reconstruct window entries, so load model/optimizer and initialize an empty rolling history. An early version-2 checkpoint without a stable camera mapping also resets its Conf history explicitly. Never reinterpret old cumulative sums as history entries. A saved/requested W mismatch must explicitly reset with a message or reject, not silently reinterpret shapes. PLY remains unchanged.
 
 ## Selection and RFAS invariants
 

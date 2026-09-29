@@ -51,6 +51,7 @@ class GaussianModel:
         self.conf_camera_ids = torch.empty(0, dtype=torch.int64)
         self.conf_window_size = 3
         self.conf_topology_version = 0
+        self.conf_camera_mapping = None
         # 候选选择统计（每次 densification 时更新）
         self.candidate_stats = {}
 
@@ -95,6 +96,7 @@ class GaussianModel:
                 'window_size': self.conf_window_size,
                 'history': self.conf_history,
                 'camera_ids': self.conf_camera_ids,
+                'camera_mapping': self.conf_camera_mapping,
                 'world_sum': self.conf_world_sum,
                 'norm_sum': self.conf_norm_sum,
                 'view_count': self.conf_view_count,
@@ -129,12 +131,22 @@ class GaussianModel:
                 # history cannot be reconstructed, so start an empty window.
                 conf_state = None
         if conf_state is not None:
-            n = self.get_xyz.shape[0]
             window = conf_state.get('window_size')
             if not isinstance(window, int) or window < 2:
                 raise ValueError('Invalid Conf checkpoint window size')
             if window != self.conf_window_size:
                 raise ValueError(f'Conf checkpoint window size {window} differs from configured conf_window_size {self.conf_window_size}')
+            saved_mapping = conf_state.get('camera_mapping')
+            if saved_mapping is None:
+                # Older v2 checkpoints used shuffle-dependent camera UIDs.
+                # Their history cannot be matched safely to dataset images.
+                print('Conf checkpoint has no stable camera mapping; resetting its rolling history')
+                conf_state = None
+            else:
+                self.set_conf_camera_mapping(saved_mapping)
+        if conf_state is not None:
+            n = self.get_xyz.shape[0]
+            window = conf_state['window_size']
             specs = [('world_sum', (n, 3), torch.float32),
                      ('norm_sum', (n, 1), torch.float32),
                      ('view_count', (n, 1), torch.int32),
@@ -219,6 +231,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.reset_conf_window()
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -341,6 +354,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+        self.reset_conf_window()
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -389,12 +403,30 @@ class GaussianModel:
         self.conf_score = torch.zeros((n, 1), device=device, dtype=torch.float32)
         self.conf_history = torch.zeros((n, self.conf_window_size, 4), device=device, dtype=torch.float32)
         self.conf_camera_ids = torch.full((n, self.conf_window_size), -1, device=device, dtype=torch.int64)
+        self.conf_topology_version += 1
+
+    def set_conf_camera_mapping(self, mapping):
+        """Bind stable training-view IDs and validate restored checkpoint IDs."""
+        if not isinstance(mapping, dict) or any(
+                not isinstance(key, int) or key < 0 or key >= (1 << 63)
+                or not isinstance(identity, str)
+                for key, identity in mapping.items()):
+            raise ValueError('Invalid Conf camera mapping')
+        if len(set(mapping.values())) != len(mapping):
+            raise ValueError('Duplicate Conf camera identity')
+        if self.conf_camera_mapping is not None and self.conf_camera_mapping != mapping:
+            raise ValueError('Conf checkpoint camera mapping differs from the current training scene')
+        self.conf_camera_mapping = dict(mapping)
 
     @torch.no_grad()
-    def add_conf_stats(self, samples, camera_key):
+    def add_conf_stats(self, samples, camera_key, topology_version):
         """Refresh each contributing Gaussian's last-N-view CUDA history."""
+        if topology_version != self.conf_topology_version:
+            raise ValueError('Conf samples belong to a stale Gaussian topology')
         if int(camera_key) < 0:
             raise ValueError('Conf camera key must be nonnegative')
+        if self.conf_camera_mapping is not None and int(camera_key) not in self.conf_camera_mapping:
+            raise ValueError('Conf camera key is absent from the training scene mapping')
         if not isinstance(samples, torch.Tensor) or samples.shape != (self.get_xyz.shape[0], 4):
             raise ValueError('Conf samples must have shape (N,4) for current topology')
         from diff_gaussian_rasterization import accumulate_conf

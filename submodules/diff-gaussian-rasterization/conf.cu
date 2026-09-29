@@ -122,6 +122,10 @@ torch::Tensor AccumulateConfCUDA(
   const auto device = samples.device();
   check_tensor(samples, "samples", torch::kFloat32, device);
   check_tensor(history, "history", torch::kFloat32, device);
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>(samples.data_ptr()) % alignof(float4) == 0,
+              "samples must be 16-byte aligned for float4 access");
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>(history.data_ptr()) % alignof(float4) == 0,
+              "history must be 16-byte aligned for float4 access");
   check_tensor(camera_ids, "camera_ids", torch::kInt64, device);
   check_tensor(view_count, "view_count", torch::kInt32, device);
   check_tensor(world_sum, "world_sum", torch::kFloat32, device);

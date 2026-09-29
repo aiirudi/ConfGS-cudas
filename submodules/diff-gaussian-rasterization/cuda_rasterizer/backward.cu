@@ -513,15 +513,20 @@ PerGaussianRenderCUDA(
   	#pragma unroll
 	for (int i = 0; i < BLOCK_SIZE + 31; ++i) {
     if (i % 32 == 0) {
-      for (int ch = 0; ch < C; ++ch) {
-        int shift = BLOCK_SIZE * ch + i + block.thread_rank();
-        Shared_sampled_ar[ch * 32 + block.thread_rank()] = sampled_ar[shift];
-      }
+      // The last iteration drains the warp pipeline. It has no next bucket
+      // to prefetch, and edge tiles contain pixels outside the image.
       const uint32_t local_id = i + block.thread_rank();
       const uint2 pix = {pix_min.x + local_id % BLOCK_X, pix_min.y + local_id / BLOCK_X};
+      const bool valid_prefetch = local_id < BLOCK_SIZE && pix.x < W && pix.y < H;
+      for (int ch = 0; ch < C; ++ch) {
+        int shift = BLOCK_SIZE * ch + local_id;
+        Shared_sampled_ar[ch * 32 + block.thread_rank()] =
+            valid_prefetch ? sampled_ar[shift] : 0.0f;
+      }
       const uint32_t id = W * pix.y + pix.x;
       for (int ch = 0; ch < C; ++ch) {
-        Shared_pixels[ch * 32 + block.thread_rank()] = pixel_colors[ch * H * W + id];
+        Shared_pixels[ch * 32 + block.thread_rank()] =
+            valid_prefetch ? pixel_colors[ch * H * W + id] : 0.0f;
       }
       block.sync();
     }
@@ -724,6 +729,7 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
+	if (B == 0) return;
 	const int THREADS = 32;
 	PerGaussianRenderCUDA<NUM_CHAFFELS> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>(
 		ranges,
