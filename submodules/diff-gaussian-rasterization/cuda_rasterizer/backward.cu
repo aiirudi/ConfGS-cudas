@@ -11,6 +11,7 @@
 
 #include "backward.h"
 #include "auxiliary.h"
+#include <cfloat>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -391,11 +392,13 @@ __global__ void preprocessCUDA(
 	// must still include the covariance and SH paths.
 	if (conf_samples != nullptr && conf_samples[idx].w >= 0.0f)
 	{
-		float magnitude = hypotf(hypotf(dL_dmean.x, dL_dmean.y), dL_dmean.z);
+		double magnitude = sqrt(double(dL_dmean.x) * dL_dmean.x +
+			double(dL_dmean.y) * dL_dmean.y + double(dL_dmean.z) * dL_dmean.z);
 		if (isfinite(m_hom.w) && m_hom.w > 1e-8f &&
 			isfinite(dL_dmean2D[idx].x) && isfinite(dL_dmean2D[idx].y) &&
 			isfinite(magnitude))
-			conf_samples[idx] = make_float4(dL_dmean.x, dL_dmean.y, dL_dmean.z, magnitude);
+			conf_samples[idx] = make_float4(dL_dmean.x, dL_dmean.y, dL_dmean.z,
+				float(fmin(magnitude, double(FLT_MAX))));
 		else
 			conf_samples[idx].w = -1.0f;
 	}

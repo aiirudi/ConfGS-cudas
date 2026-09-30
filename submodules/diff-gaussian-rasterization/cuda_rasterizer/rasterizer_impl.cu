@@ -229,8 +229,8 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	obtain(chunk, img.accum_alpha, N, 128);
 	obtain(chunk, img.n_contrib, N, 128);
 	obtain(chunk, img.ranges, N, 128);
-	int* dummy;
-	int* wummy;
+	int* dummy = nullptr;
+	int* wummy = nullptr;
 	cub::DeviceScan::InclusiveSum(nullptr, img.scan_size, dummy, wummy, N);
 	obtain(chunk, img.contrib_scan, img.scan_size, 128);
 

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode="${1:-kernel}"
 image="${CONF_CUDA_DOCKER_IMAGE:-pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel}"
-build_root="${CONF_CUDA_BUILD_ROOT:-/tmp/conf_cuda_sliding_build_20260930}"
+build_root="${CONF_CUDA_BUILD_ROOT:-/tmp/conf_cuda_numerics_build_20260930}"
 baseline_root="${CONF_CUDA_BASELINE_ROOT:-/tmp/conf_cuda_baseline_source/build-lib/diff_gaussian_rasterization}"
 deps_root="${CONF_CUDA_DEPS_ROOT:-/tmp/conf_cuda_deps}"
 garden_root="${CONF_CUDA_GARDEN_ROOT:-/home/xzh/xzh/data/3dgs/mipnerf/garden}"
@@ -28,6 +28,17 @@ run_container() {
 }
 
 case "$mode" in
+    build)
+        mkdir -p "$build_root"
+        docker run --rm --gpus all \
+            -v "$repo_root:/workspace:ro" \
+            -v "$build_root:/build" \
+            -e TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}" \
+            -e MAX_JOBS="${MAX_JOBS:-4}" \
+            "$image" bash -lc \
+            'cd /workspace/submodules/diff-gaussian-rasterization && python setup.py build_ext --build-temp /build/temp --build-lib /build/lib && cp diff_gaussian_rasterization/__init__.py /build/lib/diff_gaussian_rasterization/__init__.py' \
+            2>&1 | tee "$log_root/build.log"
+        ;;
     kernel)
         run_container python tests/test_conf_cuda.py TestConfCudaKernel \
             2>&1 | tee "$log_root/kernel.log"
@@ -43,6 +54,12 @@ case "$mode" in
     lifecycle)
         run_container python scripts/validate_conf_lifecycle.py \
             2>&1 | tee "$log_root/lifecycle.log"
+        ;;
+    checkpoint)
+        run_container python test_checkpoint.py \
+            2>&1 | tee "$log_root/checkpoint.log"
+        run_container python validate_conf_stats.py \
+            2>&1 | tee "$log_root/stats.log"
         ;;
     sanitizer)
         run_container compute-sanitizer --tool memcheck --error-exitcode 99 \
@@ -87,7 +104,7 @@ case "$mode" in
             2>&1 | tee "$log_root/$run_name.log"
         ;;
     *)
-        echo "usage: $0 {kernel|raster|sanitizer|lifecycle|garden-zero|garden-default}" >&2
+        echo "usage: $0 {build|kernel|raster|sanitizer|lifecycle|checkpoint|garden-zero|garden-default}" >&2
         exit 2
         ;;
 esac

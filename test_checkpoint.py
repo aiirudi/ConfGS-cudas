@@ -47,6 +47,7 @@ def main():
     source.conf_camera_ids[0, :2] = torch.tensor([1, 4], device='cuda')
     state = source.capture()
     assert len(state) == 13
+    assert state[12]['version'] == 3
 
     restored = make_model()
     restored.set_conf_camera_mapping({1: 'view-one', 4: 'view-four'})
@@ -58,6 +59,50 @@ def main():
     assert torch.equal(restored.conf_history, source.conf_history)
     assert torch.equal(restored.conf_camera_ids, source.conf_camera_ids)
     assert restored.conf_camera_mapping == source.conf_camera_mapping
+
+    # Upgrade v2 from its authoritative ordered history, including a cache
+    # already corrupted by float32 overflow. Casting the cache is insufficient.
+    old_conf = dict(state[12], version=2)
+    old_conf['world_sum'] = source.conf_world_sum.float()
+    old_conf['norm_sum'] = source.conf_norm_sum.float()
+    old_conf['history'] = source.conf_history.clone()
+    old_conf['history'][0, 0] = torch.tensor([2e38, 0., 0., 2e38], device='cuda')
+    old_conf['history'][0, 1] = torch.tensor([-2e38, 0., 0., 2e38], device='cuda')
+    old_conf['norm_sum'][0] = float('inf')
+    old_conf['score'] = source.conf_score.clone()
+    old_conf['score'][0] = 0.
+    upgraded = make_model()
+    upgraded.restore(state[:12] + (old_conf,), args)
+    assert upgraded.conf_world_sum.dtype == torch.float64
+    assert upgraded.conf_norm_sum.dtype == torch.float64
+    assert upgraded.conf_score[0].item() == 1.
+    assert torch.isfinite(upgraded.conf_norm_sum).all()
+    assert torch.equal(upgraded.conf_camera_ids, source.conf_camera_ids)
+    assert torch.equal(upgraded.conf_history, old_conf['history'])
+    assert torch.equal(upgraded.conf_view_count, source.conf_view_count)
+    # A refresh after migration must retain the same oldest/newest ordering.
+    replacement = torch.zeros((3, 4), device='cuda')
+    replacement[:, 3] = -1.
+    replacement[0] = torch.tensor([1., 0., 0., 1.], device='cuda')
+    upgraded.add_conf_stats(replacement, 1, upgraded.conf_topology_version)
+    assert upgraded.conf_camera_ids[0].tolist() == [4, 1, -1]
+
+    # Reject malformed native-kernel state before it can reach CUDA.
+    corruptions = (
+        ('view_count', torch.tensor([[4], [0], [0]], dtype=torch.int32, device='cuda')),
+        ('camera_ids', torch.tensor([[1, 1, -1], [-1, -1, -1], [-1, -1, -1]],
+                                    dtype=torch.int64, device='cuda')),
+        ('camera_ids', torch.tensor([[1, 99, -1], [-1, -1, -1], [-1, -1, -1]],
+                                    dtype=torch.int64, device='cuda')),
+    )
+    for key, value in corruptions:
+        invalid = make_model()
+        try:
+            invalid.restore(state[:12] + (dict(state[12], **{key: value}),), args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'Malformed Conf checkpoint {key} was accepted')
 
     wrong_scene = make_model()
     wrong_scene.set_conf_camera_mapping({1: 'another-view', 4: 'view-four'})

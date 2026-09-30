@@ -1,5 +1,14 @@
 # CUDA Conf: per-Gaussian rolling multi-view window
 
+**Numerical revision:** [conf_cuda_numerics_review.md](conf_cuda_numerics_review.md)
+supersedes the float32 aggregate and version-2 checkpoint details below.
+Production now computes and stores S/M in float64, reconstructs each norm
+from float32 xyz, stores version-3 checkpoints, and migrates mapped v2
+histories without changing camera order. History/sample w is a finite
+float32 validity/norm marker (saturated at FLT_MAX when necessary), rather
+than the source of the denominator. Resident state is `(24*W+40)` bytes
+per Gaussian. All native rasterizer entry points enforce the default stream.
+
 ## Revised requirement
 
 This document supersedes the original interval-wide accumulation design. The user requires `--conf_window_size W`, default **3**, to hold each Gaussian's most recent W distinct **actually visible** camera observations. The fourth new valid view at W=3 evicts that Gaussian's oldest gradient. Global training-camera visits do not advance a Gaussian's window when it does not contribute to the rendered image.

@@ -92,7 +92,7 @@ class GaussianModel:
             self.shoptimizer.state_dict(),
             self.spatial_lr_scale,
             {
-                'version': 2,
+                'version': 3,
                 'window_size': self.conf_window_size,
                 'history': self.conf_history,
                 'camera_ids': self.conf_camera_ids,
@@ -124,7 +124,7 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         if conf_state is not None:
-            if not isinstance(conf_state, dict) or conf_state.get('version') not in (1, 2):
+            if not isinstance(conf_state, dict) or conf_state.get('version') not in (1, 2, 3):
                 raise ValueError('Unsupported Conf checkpoint state')
             if conf_state['version'] == 1:
                 # v1 stored only sums and a global camera set; per-Gaussian
@@ -147,8 +147,9 @@ class GaussianModel:
         if conf_state is not None:
             n = self.get_xyz.shape[0]
             window = conf_state['window_size']
-            specs = [('world_sum', (n, 3), torch.float32),
-                     ('norm_sum', (n, 1), torch.float32),
+            aggregate_dtype = torch.float64 if conf_state['version'] == 3 else torch.float32
+            specs = [('world_sum', (n, 3), aggregate_dtype),
+                     ('norm_sum', (n, 1), aggregate_dtype),
                      ('view_count', (n, 1), torch.int32),
                      ('score', (n, 1), torch.float32),
                      ('history', (n, window, 4), torch.float32),
@@ -157,13 +158,11 @@ class GaussianModel:
                 value = conf_state.get(key)
                 if not isinstance(value, torch.Tensor) or value.shape != shape or value.dtype != dtype or value.device != self.get_xyz.device:
                     raise ValueError(f'Invalid Conf checkpoint tensor: {key}')
-            self.conf_world_sum = conf_state['world_sum'].contiguous()
-            self.conf_norm_sum = conf_state['norm_sum'].contiguous()
             self.conf_view_count = conf_state['view_count'].contiguous()
-            self.conf_score = conf_state['score'].contiguous()
             self.conf_history = conf_state['history'].contiguous()
             self.conf_camera_ids = conf_state['camera_ids'].contiguous()
             self.conf_window_size = window
+            self._restore_conf_aggregates()
         self.optimizer.load_state_dict(opt_dict)
         self.shoptimizer.load_state_dict(shopt_dict)
 
@@ -397,13 +396,46 @@ class GaussianModel:
         """Clear the per-Gaussian rolling view history (initialization only)."""
         n = self.get_xyz.shape[0]
         device = self.get_xyz.device
-        self.conf_world_sum = torch.zeros((n, 3), device=device, dtype=torch.float32)
-        self.conf_norm_sum = torch.zeros((n, 1), device=device, dtype=torch.float32)
+        self.conf_world_sum = torch.zeros((n, 3), device=device, dtype=torch.float64)
+        self.conf_norm_sum = torch.zeros((n, 1), device=device, dtype=torch.float64)
         self.conf_view_count = torch.zeros((n, 1), device=device, dtype=torch.int32)
         self.conf_score = torch.zeros((n, 1), device=device, dtype=torch.float32)
         self.conf_history = torch.zeros((n, self.conf_window_size, 4), device=device, dtype=torch.float32)
         self.conf_camera_ids = torch.full((n, self.conf_window_size), -1, device=device, dtype=torch.int64)
         self.conf_topology_version += 1
+
+    @torch.no_grad()
+    def _restore_conf_aggregates(self):
+        """Validate saved histories and upgrade v2 caches without losing recency."""
+        count = self.conf_view_count
+        window = self.conf_window_size
+        if ((count < 0) | (count > window)).any().item():
+            raise ValueError('Invalid Conf checkpoint view counts')
+        occupied = torch.arange(window, device=count.device)[None, :] < count
+        ids = self.conf_camera_ids
+        known_ids = torch.tensor(list(self.conf_camera_mapping), device=ids.device,
+                                 dtype=torch.int64)
+        if ((occupied & ~torch.isin(ids, known_ids))
+                | (~occupied & (ids != -1))).any().item():
+            raise ValueError('Invalid Conf checkpoint camera IDs')
+        sorted_ids = ids.sort(dim=1).values
+        if ((sorted_ids[:, 1:] >= 0)
+                & (sorted_ids[:, 1:] == sorted_ids[:, :-1])).any().item():
+            raise ValueError('Duplicate Conf checkpoint camera IDs')
+        active_history = self.conf_history[occupied]
+        if (not torch.isfinite(active_history).all().item()
+                or (active_history[:, 3] < 0).any().item()):
+            raise ValueError('Invalid Conf checkpoint gradient history')
+        # xyz is authoritative. v2 float32 caches may already have overflowed
+        # or rounded subnormal norms; merely casting them cannot repair that.
+        vectors = self.conf_history[:, :, :3].double().masked_fill(~occupied[:, :, None], 0)
+        self.conf_world_sum = vectors.sum(dim=1)
+        self.conf_norm_sum = torch.linalg.vector_norm(vectors, dim=2).sum(dim=1, keepdim=True)
+        positive = self.conf_norm_sum > 0
+        denominator = torch.where(positive, self.conf_norm_sum, 1.)
+        score = (1. - torch.linalg.vector_norm(self.conf_world_sum, dim=1, keepdim=True)
+                 / denominator).clamp(0., 1.)
+        self.conf_score = torch.where((count >= 2) & positive, score, 0.).float()
 
     def set_conf_camera_mapping(self, mapping):
         """Bind stable training-view IDs and validate restored checkpoint IDs."""
@@ -510,8 +542,8 @@ class GaussianModel:
         if new_n < 0:
             raise RuntimeError('Gaussian topology shrank during append')
         device = self.get_xyz.device
-        self.conf_world_sum = torch.cat((self.conf_world_sum, torch.zeros((new_n, 3), device=device)), dim=0)
-        self.conf_norm_sum = torch.cat((self.conf_norm_sum, torch.zeros((new_n, 1), device=device)), dim=0)
+        self.conf_world_sum = torch.cat((self.conf_world_sum, self.conf_world_sum.new_zeros((new_n, 3))), dim=0)
+        self.conf_norm_sum = torch.cat((self.conf_norm_sum, self.conf_norm_sum.new_zeros((new_n, 1))), dim=0)
         self.conf_view_count = torch.cat((self.conf_view_count, torch.zeros((new_n, 1), device=device, dtype=torch.int32)), dim=0)
         self.conf_score = torch.cat((self.conf_score, torch.zeros((new_n, 1), device=device)), dim=0)
         self.conf_history = torch.cat((self.conf_history, torch.zeros((new_n, self.conf_window_size, 4), device=device)), dim=0)

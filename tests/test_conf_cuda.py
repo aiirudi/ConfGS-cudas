@@ -17,8 +17,8 @@ def _state(n, window, device="cuda"):
         "history": torch.zeros((n, window, 4), device=device, dtype=torch.float32),
         "camera_ids": torch.full((n, window), -1, device=device, dtype=torch.int64),
         "view_count": torch.zeros((n, 1), device=device, dtype=torch.int32),
-        "world_sum": torch.zeros((n, 3), device=device, dtype=torch.float32),
-        "norm_sum": torch.zeros((n, 1), device=device, dtype=torch.float32),
+        "world_sum": torch.zeros((n, 3), device=device, dtype=torch.float64),
+        "norm_sum": torch.zeros((n, 1), device=device, dtype=torch.float64),
         "conf": torch.zeros((n, 1), device=device, dtype=torch.float32),
     }
 
@@ -81,6 +81,38 @@ class TestConfCudaKernel(unittest.TestCase):
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA device unavailable")
+
+    def test_conf_is_invariant_across_float32_gradient_scales(self):
+        from diff_gaussian_rasterization import accumulate_conf
+        directions = (
+            ((1., 0., 0.), (1., 0., 0.)),
+            ((1., 0., 0.), (-1., 0., 0.)),
+            ((1., 0., 0.), (0., 1., 0.)),
+            ((1., 1., 0.), (1., 1., 0.)),
+        )
+        for scale in (1., 1e-9, 1e-40, 1e-45, 2e38, 3e38):
+            for pair in directions:
+                with self.subTest(scale=scale, pair=pair):
+                    state = _state(1, 3)
+                    vectors = []
+                    for camera_id, direction in enumerate(pair):
+                        sample = torch.tensor([[*(scale * v for v in direction), 0.]],
+                                              device="cuda", dtype=torch.float32)
+                        vectors.append(sample[0, :3].cpu().double())
+                        accumulate_conf(sample, camera_id, state["history"],
+                                        state["camera_ids"], state["view_count"],
+                                        state["world_sum"], state["norm_sum"], state["conf"])
+                    # Reference uses the actual quantized input, not the
+                    # pre-quantization scale or the float32 metadata norm.
+                    summed = vectors[0] + vectors[1]
+                    total = sum(math.hypot(*v.tolist()) for v in vectors)
+                    expected = 1. - math.hypot(*summed.tolist()) / total
+                    self.assertEqual(state["view_count"].item(), 2)
+                    self.assertTrue(torch.isfinite(state["world_sum"]).all().item())
+                    self.assertTrue(torch.isfinite(state["norm_sum"]).all().item())
+                    self.assertTrue(math.isclose(state["norm_sum"].item(), total,
+                                                rel_tol=1e-12))
+                    self.assertAlmostEqual(state["conf"].item(), expected, delta=1e-6)
 
     def test_ordered_window_matches_float64_deque_at_capacities(self):
         # Three rows have different visibility patterns.  The stream includes
@@ -150,6 +182,7 @@ class TestConfCudaKernel(unittest.TestCase):
         # kernel must observe the producer without a host synchronization.
         stream = torch.cuda.Stream()
         stream_state = _state(1, 3)
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             produced = torch.empty((1, 4), device="cuda")
             produced.fill_(0)
@@ -165,6 +198,47 @@ class TestConfCudaKernel(unittest.TestCase):
         stream.synchronize()
         self.assertEqual(stream_state["view_count"].item(), 2)
         self.assertAlmostEqual(stream_state["conf"].item(), 1.0, delta=1e-6)
+
+    def test_storage_and_native_stream_guards(self):
+        from diff_gaussian_rasterization import accumulate_conf, _C
+        state = _state(1, 3)
+        samples = torch.tensor([[1., 0., 0., 0.]], device='cuda')
+
+        def update(sample=samples, **overrides):
+            args = dict(state, **overrides)
+            return accumulate_conf(sample, 0, args['history'], args['camera_ids'],
+                                   args['view_count'], args['world_sum'],
+                                   args['norm_sum'], args['conf'])
+
+        with self.assertRaisesRegex(RuntimeError, 'world_sum.*dtype'):
+            update(world_sum=state['world_sum'].float())
+        # An offset contiguous tensor can still violate CUDA float4 alignment.
+        offset_samples = torch.zeros(5, device='cuda')[1:].reshape(1, 4)
+        with self.assertRaisesRegex(RuntimeError, '16-byte aligned'):
+            update(offset_samples)
+        offset_history = torch.zeros(13, device='cuda')[1:].reshape(1, 3, 4)
+        with self.assertRaisesRegex(RuntimeError, '16-byte aligned'):
+            update(history=offset_history)
+        with self.assertRaisesRegex(RuntimeError, 'overlap'):
+            update(norm_sum=state['world_sum'][:, :1])
+        with self.assertRaisesRegex(RuntimeError, 'overlap'):
+            update(state['history'][:, 0, :])
+
+        # Test the native binding directly: it must also reject stream mixing
+        # when callers bypass the Python autograd wrapper.
+        means = torch.tensor([[0., 0., 2.]], device='cuda')
+        matrix = torch.eye(4, device='cuda')
+        self.assertEqual(_C.conf_api_version, 3)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            with self.assertRaisesRegex(RuntimeError, 'default stream'):
+                _C.mark_visible(means, matrix, matrix)
+            from diff_gaussian_rasterization import GaussianRasterizer
+            with self.assertRaisesRegex(RuntimeError, 'default stream'):
+                GaussianRasterizer(None).markVisible(means)
+        with self.assertRaisesRegex(RuntimeError, 'CUDA tensors'):
+            _C.mark_visible(means.cpu(), matrix, matrix)
 
 
 if __name__ == "__main__":

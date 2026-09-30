@@ -11,6 +11,8 @@
 
 #include <math.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cstdio>
 #include <sstream>
 #include <iostream>
@@ -24,6 +26,15 @@
 #include <fstream>
 #include <string>
 #include <functional>
+
+namespace {
+void require_default_stream(const torch::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_cuda(), "Gaussian rasterizer requires CUDA tensors");
+  TORCH_CHECK(at::cuda::getCurrentCUDAStream(tensor.get_device()) ==
+              at::cuda::getDefaultCUDAStream(tensor.get_device()),
+              "Gaussian rasterizer requires the CUDA default stream");
+}
+} // namespace
 
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
@@ -73,6 +84,8 @@ RasterizeGaussiansCUDA(
 	const bool debug,
 	const torch::Tensor& pixel_weights)
 {
+  require_default_stream(means3D);
+  c10::cuda::CUDAGuard device_guard(means3D.device());
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
@@ -87,7 +100,7 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_color = torch::full({NUM_CHAFFELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
-  torch::Device device(torch::kCUDA);
+  torch::Device device = means3D.device();
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
   torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
@@ -225,6 +238,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool debug,
 	const bool collect_conf) 
 {
+  require_default_stream(means3D);
+  c10::cuda::CUDAGuard device_guard(means3D.device());
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
@@ -295,6 +310,8 @@ torch::Tensor markVisible(
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix)
 { 
+  require_default_stream(means3D);
+  c10::cuda::CUDAGuard device_guard(means3D.device());
   const int P = means3D.size(0);
   
   torch::Tensor present = torch::full({P}, false, means3D.options().dtype(at::kBool));
@@ -324,6 +341,8 @@ void adamUpdate(
 	const uint32_t N,
 	const uint32_t M
 ){
+	require_default_stream(param);
+	c10::cuda::CUDAGuard device_guard(param.device());
 	ADAM::adamUpdate(
 		param.contiguous().data<float>(),
 		param_grad.contiguous().data<float>(),

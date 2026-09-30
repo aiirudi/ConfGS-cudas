@@ -90,7 +90,17 @@ python train.py -s /path/to/scene -m output/conf --conf_window_size 3 --conf_min
 
 `--conf_window_size` is each Gaussian's window capacity N (default 3). `--conf_min_views` is the minimum number of distinct, actually visible views required before splitting is allowed (default 2, preserving the existing configuration). See the [design](docs/conf_cuda_design.md), [validation](docs/conf_cuda_validation.md), and [review](docs/conf_cuda_review.md) documents for details.
 
-Each Gaussian retains its most recent distinct cameras that actually contributed pixels. A visible zero-gradient observation occupies a slot; an invisible or invalid observation leaves that Gaussian's history unchanged. Revisiting a camera refreshes its slot, and a new camera evicts the oldest slot when the window is full. Histories persist across densification intervals and follow surviving Gaussians through pruning; new split rows start empty. Observations still come from different training steps, so the window is not a frozen-model comparison. At window size 3, the resident state uses about 96 bytes per Gaussian, plus a transient 16-byte sample when collection is enabled. CUDA Conf is a detached density statistic; optimization still uses the real loss gradients. The rasterizer currently requires the CUDA default stream; its Python wrapper reports an error on another stream.
+Each Gaussian retains its most recent distinct cameras that actually contributed pixels. A visible zero-gradient observation occupies a slot; an invisible or invalid observation leaves that Gaussian's history unchanged. Revisiting a camera refreshes its slot, and a new camera evicts the oldest slot when the window is full. Histories persist across densification intervals and follow surviving Gaussians through pruning; new split rows start empty. Observations still come from different training steps, so the window is not a frozen-model comparison. At window size 3, the resident state uses about 112 bytes per Gaussian, plus a transient 16-byte sample when collection is enabled. CUDA Conf is a detached density statistic; optimization still uses the real loss gradients. The rasterizer currently requires the CUDA default stream; both the Python wrapper and native bindings report an error on another stream.
+
+History vectors and scores remain float32. The CUDA accumulator reconstructs norms from the vectors and computes/stores vector sums and norm sums in float64 to avoid overflow and subnormal rounding artifacts. Version-3 checkpoints store these aggregates; version-2 checkpoints with stable camera identities migrate by reconstructing aggregates from their ordered histories, preserving the next eviction. Saved counts, IDs and active history values are validated before use.
+
+Compiled extensions are environment-specific and are no longer checked into the rasterizer package. After changing CUDA sources, rebuild in the active PyTorch/CUDA environment:
+
+```bash
+python -m pip install --no-build-isolation --force-reinstall ./submodules/diff-gaussian-rasterization
+```
+
+The wrapper checks the native Conf API version and reports a rebuild instruction for an older binary. For the documented A100 Docker environment, `scripts/run_conf_cuda_validation.sh build` builds a separate extension and copies its matching wrapper. Numerical-review results are recorded in [docs/conf_cuda_numerics_review.md](docs/conf_cuda_numerics_review.md).
 
 ## Parameters
 

@@ -14,6 +14,13 @@ import torch.nn as nn
 import torch
 from . import _C
 
+if getattr(_C, 'conf_api_version', None) != 3:
+    raise ImportError(
+        'The Gaussian rasterizer CUDA extension is out of date for Conf. '
+        'Rebuild it in the active PyTorch/CUDA environment with '
+        '`python -m pip install --no-build-isolation --force-reinstall '
+        './submodules/diff-gaussian-rasterization`.')
+
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
@@ -204,6 +211,7 @@ class GaussianRasterizer(nn.Module):
     def markVisible(self, positions):
         # Mark visible points (based on frustum culling for camera) with a boolean 
         with torch.no_grad():
+            _require_default_stream(positions)
             raster_settings = self.raster_settings
             visible = _C.mark_visible(
                 positions,
@@ -254,7 +262,7 @@ class GaussianRasterizer(nn.Module):
 
 def accumulate_conf(samples, camera_id, history, camera_ids, view_count,
                     world_sum, norm_sum, conf_out):
-    """Refresh each Gaussian's detached recent-view history on the CUDA stream."""
+    """Refresh detached history; world_sum/norm_sum must be float64 CUDA tensors."""
     return _C.accumulate_conf(samples, camera_id, history, camera_ids,
                               view_count, world_sum, norm_sum, conf_out)
 

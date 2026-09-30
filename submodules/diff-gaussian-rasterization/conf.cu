@@ -4,14 +4,23 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <cfloat>
 #include <cstdint>
 
 namespace {
 
+__device__ double vector_norm(float x, float y, float z) {
+  // Squaring any finite float32 component is safe in float64, including
+  // subnormals and values near FLT_MAX. Do not use rounded float4.w norms
+  // in the score: subnormal rounding can create artificial cancellation.
+  return sqrt(static_cast<double>(x) * x + static_cast<double>(y) * y +
+              static_cast<double>(z) * z);
+}
+
 __global__ void accumulate_conf_kernel(
     int n, int window, int64_t camera_id, const float4* samples,
     float4* history, int64_t* camera_ids, int32_t* view_count,
-    float3* world_sum, float* norm_sum, float* conf_out) {
+    double* world_sum, double* norm_sum, float* conf_out) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
 
@@ -19,8 +28,7 @@ __global__ void accumulate_conf_kernel(
   if (!(sample.w >= 0.0f) || !isfinite(sample.x) ||
       !isfinite(sample.y) || !isfinite(sample.z) || !isfinite(sample.w))
     return;
-  const float magnitude = hypotf(hypotf(sample.x, sample.y), sample.z);
-  if (!isfinite(magnitude)) return;
+  const double magnitude = vector_norm(sample.x, sample.y, sample.z);
 
   float4* row = history + static_cast<int64_t>(i) * window;
   int64_t* ids = camera_ids + static_cast<int64_t>(i) * window;
@@ -56,29 +64,33 @@ __global__ void accumulate_conf_kernel(
     ++count;
   }
 
-  row[count - 1] = make_float4(sample.x, sample.y, sample.z, magnitude);
+  // w remains float32 metadata; the exact norm is reconstructed from xyz
+  // below. Saturation keeps a finite validity marker for large vectors.
+  row[count - 1] = make_float4(sample.x, sample.y, sample.z,
+                             static_cast<float>(fmin(magnitude, double(FLT_MAX))));
   ids[count - 1] = camera_id;
   view_count[i] = count;
 
-  float3 sum = make_float3(0.0f, 0.0f, 0.0f);
-  float total_norm = 0.0f;
+  double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
+  double total_norm = 0.0;
   for (int j = 0; j < count; ++j) {
     const float4 g = row[j];
-    sum.x += g.x;
-    sum.y += g.y;
-    sum.z += g.z;
-    total_norm += g.w;
+    sum_x += g.x;
+    sum_y += g.y;
+    sum_z += g.z;
+    total_norm += vector_norm(g.x, g.y, g.z);
   }
-  world_sum[i] = sum;
+  world_sum[static_cast<int64_t>(i) * 3] = sum_x;
+  world_sum[static_cast<int64_t>(i) * 3 + 1] = sum_y;
+  world_sum[static_cast<int64_t>(i) * 3 + 2] = sum_z;
   norm_sum[i] = total_norm;
 
   float score = 0.0f;
-  if (count >= 2 && isfinite(sum.x) && isfinite(sum.y) &&
-      isfinite(sum.z) && isfinite(total_norm) && total_norm > 0.0f) {
-    const float sum_magnitude = hypotf(hypotf(sum.x, sum.y), sum.z);
+  if (count >= 2 && isfinite(sum_x) && isfinite(sum_y) &&
+      isfinite(sum_z) && isfinite(total_norm) && total_norm > 0.0) {
+    const double sum_magnitude = sqrt(sum_x * sum_x + sum_y * sum_y + sum_z * sum_z);
     if (isfinite(sum_magnitude)) {
-      score = 1.0f - sum_magnitude / total_norm;
-      score = fminf(1.0f, fmaxf(0.0f, score));
+      score = static_cast<float>(fmin(1.0, fmax(0.0, 1.0 - sum_magnitude / total_norm)));
     }
   }
   conf_out[i] = score;
@@ -128,8 +140,8 @@ torch::Tensor AccumulateConfCUDA(
               "history must be 16-byte aligned for float4 access");
   check_tensor(camera_ids, "camera_ids", torch::kInt64, device);
   check_tensor(view_count, "view_count", torch::kInt32, device);
-  check_tensor(world_sum, "world_sum", torch::kFloat32, device);
-  check_tensor(norm_sum, "norm_sum", torch::kFloat32, device);
+  check_tensor(world_sum, "world_sum", torch::kFloat64, device);
+  check_tensor(norm_sum, "norm_sum", torch::kFloat64, device);
   check_tensor(conf_out, "conf_out", torch::kFloat32, device);
   TORCH_CHECK(camera_ids.dim() == 2 && camera_ids.size(0) == n && camera_ids.size(1) == window,
               "camera_ids must have shape (N,window)");
@@ -156,8 +168,7 @@ torch::Tensor AccumulateConfCUDA(
       reinterpret_cast<const float4*>(samples.data_ptr<float>()),
       reinterpret_cast<float4*>(history.data_ptr<float>()),
       camera_ids.data_ptr<int64_t>(), view_count.data_ptr<int32_t>(),
-      reinterpret_cast<float3*>(world_sum.data_ptr<float>()),
-      norm_sum.data_ptr<float>(), conf_out.data_ptr<float>());
+      world_sum.data_ptr<double>(), norm_sum.data_ptr<double>(), conf_out.data_ptr<float>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return conf_out;
 }
